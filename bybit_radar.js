@@ -31,8 +31,14 @@ const HISTORY_JSON = path.join(__dirname, 'bybit_market_history.json');
 
 // Configuración
 let REFRESH_INTERVAL_MS = 800; // Refresco cada 800ms por defecto
-let MIN_SPREAD_BOB = 0.02;     // Avisar con ganancia >= 0.02 BOB/USDT por defecto (capital corto para valores menores)
+let MIN_SPREAD_BOB = 0.02;     // Spread MÍNIMO (filtro bruto). La alarma final requiere además ganancia neta positiva.
 let DEFAULT_TRADE_USDT = 100;  // Monto por defecto para pedidos
+// Fee del taker en Bybit P2P = $0 (confirmado para taker↔taker dentro del mismo exchange).
+// Overridear con --fee <X> cuando se modele arbitraje cruzado:
+//   p.ej. --fee 0.50 para simular retiro BEP-20 saliendo de Bybit hacia Binance.
+let BYBIT_TOTAL_FEE_USDT = 0.00;
+// Alarma solo cuando la ganancia neta sea >= este valor (default 0.01 BOB para evitar ruido de redondeo).
+let MIN_NET_PROFIT_BOB = 0.01;
 const radarArgs = process.argv.slice(2);
 
 // Parámetro de margen / spread mínimo (CLI o .env):
@@ -41,6 +47,20 @@ if (spreadArgIdx !== -1 && radarArgs[spreadArgIdx + 1] && !isNaN(parseFloat(rada
     MIN_SPREAD_BOB = parseFloat(radarArgs[spreadArgIdx + 1]);
 } else if (env.BYBIT_MIN_SPREAD_BOB && !isNaN(parseFloat(env.BYBIT_MIN_SPREAD_BOB))) {
     MIN_SPREAD_BOB = parseFloat(env.BYBIT_MIN_SPREAD_BOB);
+}
+
+// Fee USDT (CLI o .env):
+const feeArgIdx = radarArgs.findIndex(a => a === '--fee' || a === '-f');
+if (feeArgIdx !== -1 && radarArgs[feeArgIdx + 1] && !isNaN(parseFloat(radarArgs[feeArgIdx + 1]))) {
+    BYBIT_TOTAL_FEE_USDT = parseFloat(radarArgs[feeArgIdx + 1]);
+} else if (env.BYBIT_TOTAL_FEE_USDT && !isNaN(parseFloat(env.BYBIT_TOTAL_FEE_USDT))) {
+    BYBIT_TOTAL_FEE_USDT = parseFloat(env.BYBIT_TOTAL_FEE_USDT);
+}
+
+// Ganancia neta mínima (CLI o .env):
+const minProfitIdx = radarArgs.findIndex(a => a === '--min-profit' || a === '-p');
+if (minProfitIdx !== -1 && radarArgs[minProfitIdx + 1] && !isNaN(parseFloat(radarArgs[minProfitIdx + 1]))) {
+    MIN_NET_PROFIT_BOB = parseFloat(radarArgs[minProfitIdx + 1]);
 }
 
 let ONLY_COMPATIBLE_LIMITS = radarArgs.includes('--strict') || radarArgs.includes('--only-compatible');
@@ -274,6 +294,7 @@ function findArbitrageGaps(sellers = [], buyers = []) {
 
             if (sellPrice > buyPrice && buyPrice > 0) {
                 const spread = parseFloat((sellPrice - buyPrice).toFixed(3));
+                // Filtro bruto por spread mínimo (barato de calcular)
                 if (spread >= MIN_SPREAD_BOB) {
                     const marginPercent = ((spread / buyPrice) * 100).toFixed(2);
                     const limits = analyzeLimitCompatibility(buyPrice, s, sellPrice, b);
@@ -283,6 +304,14 @@ function findArbitrageGaps(sellers = [], buyers = []) {
                         continue;
                     }
 
+                    // Cálculo neto REAL descontando fees (análogo a binance_radar)
+                    const tradeUsdt = limits.suggestedTradeUsdt || DEFAULT_TRADE_USDT;
+                    const grossProfitBob = spread * tradeUsdt;
+                    const feeCostBob = BYBIT_TOTAL_FEE_USDT * sellPrice;
+                    const netProfitBob = parseFloat((grossProfitBob - feeCostBob).toFixed(2));
+                    const breakEvenSpreadBob = tradeUsdt > 0 ? parseFloat((feeCostBob / tradeUsdt).toFixed(4)) : 0;
+                    const isProfitable = netProfitBob >= MIN_NET_PROFIT_BOB;
+
                     gaps.push({
                         seller: s,
                         buyer: b,
@@ -291,6 +320,11 @@ function findArbitrageGaps(sellers = [], buyers = []) {
                         spread: spread,
                         marginPercent: marginPercent,
                         limits: limits,
+                        grossProfitBob: parseFloat(grossProfitBob.toFixed(2)),
+                        feeCostBob: parseFloat(feeCostBob.toFixed(2)),
+                        netProfitBob: netProfitBob,
+                        breakEvenSpreadBob: breakEvenSpreadBob,
+                        isProfitable: isProfitable,
                         detail: `Comprar a ${buyPrice.toFixed(3)} BOB y vender a ${sellPrice.toFixed(3)} BOB`
                     });
                 }
@@ -652,7 +686,7 @@ async function startGapHunterLoop() {
 
     console.clear();
     console.log('🚀 INICIANDO RADAR CAZADOR DE BRECHAS PURAS BYBIT P2P (TAKER)...');
-    console.log(`⚡ Tasa de refresco: Cada ${REFRESH_INTERVAL_MS}ms | Margen mínimo: >= ${MIN_SPREAD_BOB} BOB`);
+    console.log(`⚡ Tasa de refresco: Cada ${REFRESH_INTERVAL_MS}ms | Spread mín: >= ${MIN_SPREAD_BOB} BOB | Fee: $${BYBIT_TOTAL_FEE_USDT} | Ganancia Neta: >= ${MIN_NET_PROFIT_BOB} BOB`);
     console.log(`🛡️  Filtro estricto de límites: ${ONLY_COMPATIBLE_LIMITS ? 'ON' : 'OFF'}`);
     console.log(`🛡️  Filtro de elegibilidad: ${FILTER_ELIGIBLE ? `ON (descartando >${MAX_ACCOUNT_DAYS}d antigüedad | Ignorados: ${loadIgnoredMerchants().length})` : 'OFF'}\n`);
 
@@ -697,7 +731,7 @@ async function startGapHunterLoop() {
                 console.log(` ⚡ RADAR CAZADOR DE BRECHAS BYBIT P2P (TAKER ➔ TAKER) [${nowTime}]`);
                 console.log('========================================================================================');
                 console.log(` 📡 Peticiones: #${totalReqs} (~${reqPerSec} req/s) │ ⚡ Latencia: ${latency}ms │ 🎯 Brechas: ${opportunitiesCount} │ 🚫 Bloqueados: ${ignoredList.length}`);
-                console.log(` 🛡️ Elegibles: ${FILTER_ELIGIBLE ? 'ON' : 'OFF'} │ 📈 Spread mín: >= ${MIN_SPREAD_BOB} BOB │ ⏱️ Intervalo: ${REFRESH_INTERVAL_MS}ms │ 🔊 Sonido: ${isSoundMuted() ? '\x1b[31m\x1b[1mOFF (MUTE)\x1b[0m' : '\x1b[32m\x1b[1mON [Alarm01]\x1b[0m'}`);
+                console.log(` 🛡️ Elegibles: ${FILTER_ELIGIBLE ? 'ON' : 'OFF'} │ 📈 Spread mín: >= ${MIN_SPREAD_BOB} BOB │ 💸 Fee: $${BYBIT_TOTAL_FEE_USDT} │ ⏱️ Intervalo: ${REFRESH_INTERVAL_MS}ms │ 🔊 Sonido: ${isSoundMuted() ? '\x1b[31m\x1b[1mOFF (MUTE)\x1b[0m' : '\x1b[32m\x1b[1mON [Alarm01]\x1b[0m'}`);
                 console.log(' ⌨️  [s]: Mute | [b]: Bloq | [+/-]: Spread mín | [e]: Elegibles | [c]: Comprar | [v]: Vender | [q]: Salir');
                 console.log('----------------------------------------------------------------------------------------');
 
@@ -711,13 +745,20 @@ async function startGapHunterLoop() {
                     console.log('----------------------------------------------------------------------------------------');
                 }
 
-                if (gaps.length > 0) {
+                // Priorizar el gap RENTABLE (netProfitBob >= MIN_NET_PROFIT_BOB).
+                // Si no hay rentables pero sí hay con spread suficiente, se trackean pero sin alarma sonora.
+                const profitableGaps = gaps.filter(g => g.isProfitable);
+                if (profitableGaps.length > 0) {
                     opportunitiesCount++;
                     lastAlertTime = nowTime;
-                    currentActiveGap = gaps[0];
+                    currentActiveGap = profitableGaps[0];
                     renderBigGapAlert(currentActiveGap, nowTime);
                     logOpportunity(currentActiveGap);
                     console.log('----------------------------------------------------------------------------------------');
+                } else if (gaps.length > 0) {
+                    // Hay brechas por spread pero ninguna cubre el fee → trackear silenciosamente
+                    currentActiveGap = gaps[0];
+                    logOpportunity(gaps[0]);
                 } else {
                     currentActiveGap = null;
                     radarLogger.markNoGap();  // emite CLOSE si había un gap activo trackeado
@@ -747,10 +788,21 @@ async function startGapHunterLoop() {
 
                 console.log('----------------------------------------------------------------------------------------');
                 
-                if (parseFloat(currentSpread) >= MIN_SPREAD_BOB) {
-                    console.log(` 🔥 SPREAD SUFICIENTE: \x1b[32m\x1b[1m+${currentSpread} BOB/USDT\x1b[0m (¡Oportunidad activa >= ${MIN_SPREAD_BOB} BOB!)`);
+                // Cálculo neto para el "diferencial actual" entre las puntas (puede diferir del gap top real)
+                const _tradeUsdtCur = DEFAULT_TRADE_USDT;
+                const _feeCostBobCur = BYBIT_TOTAL_FEE_USDT * bestSellPrice;
+                const _netProfitCur = parseFloat((parseFloat(currentSpread) * _tradeUsdtCur - _feeCostBobCur).toFixed(2));
+                const _breakEvenSpreadCur = _tradeUsdtCur > 0 ? (_feeCostBobCur / _tradeUsdtCur).toFixed(4) : '0';
+
+                if (parseFloat(currentSpread) >= MIN_SPREAD_BOB && _netProfitCur >= MIN_NET_PROFIT_BOB) {
+                    const feeTag = BYBIT_TOTAL_FEE_USDT > 0 ? ` · Fee: -$${BYBIT_TOTAL_FEE_USDT} [${_feeCostBobCur.toFixed(2)} Bs]` : '';
+                    console.log(` 🔥 RENTABLE EN BYBIT: \x1b[32m\x1b[1m+${_netProfitCur.toFixed(2)} BOB netos\x1b[0m rotando ${_tradeUsdtCur} USDT (Spread: +${currentSpread} BOB${feeTag})`);
                 } else if (parseFloat(currentSpread) > 0) {
-                    console.log(` 🟡 SPREAD INSUFICIENTE: +${currentSpread} BOB/USDT (Menor al mínimo de ${MIN_SPREAD_BOB} BOB - Capital corto, sin alarma)`);
+                    if (BYBIT_TOTAL_FEE_USDT > 0) {
+                        console.log(` 🟡 NO RENTABLE (+${currentSpread} BOB/USDT): Con ${_tradeUsdtCur} USDT da ${_netProfitCur.toFixed(2)} Bs netos (necesitas spread >= ${_breakEvenSpreadCur} BOB para cubrir $${BYBIT_TOTAL_FEE_USDT} fee). Alarma apagada.`);
+                    } else {
+                        console.log(` 🟡 SPREAD INSUFICIENTE: +${currentSpread} BOB/USDT (Menor al mínimo de ${MIN_SPREAD_BOB} BOB - Capital corto, sin alarma)`);
+                    }
                 } else {
                     console.log(` ⚖️  Diferencial Actual: ${currentSpread} BOB (En espera de cruce donde Venta > Compra)`);
                 }

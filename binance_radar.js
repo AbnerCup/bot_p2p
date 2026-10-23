@@ -35,7 +35,10 @@ const HISTORY_JSON = path.join(__dirname, 'binance_market_history.json');
 // Configuración de Capital Dinámico y Comisiones Binance
 let REFRESH_INTERVAL_MS = 800;    // Refresco cada 800ms por defecto
 let MAX_CAPITAL_USDT = 360;       // Capital máximo rotativo disponible del usuario ($360 USDT por defecto)
-let BINANCE_TOTAL_FEE_USDT = 0.15;// Comisión fija total ($0.15 USDT: $0.07 compra + $0.07 venta + margen)
+// Fee del taker en Binance P2P = $0 (confirmado para operación taker↔taker dentro del mismo exchange).
+// Mantener en 0 para same-exchange. Overridear con --fee <X> cuando se modele arbitraje cruzado:
+// p.ej. --fee 0.29 para simular retiro BEP-20 saliendo de Binance hacia Bybit.
+let BINANCE_TOTAL_FEE_USDT = 0.00;
 let MIN_NET_PROFIT_BOB = 0.01;    // Alarma solo cuando la ganancia neta real sea positiva (>= 0.01 BOB)
 let DEFAULT_TRADE_USDT = 360;     // Monto base sugerido
 const radarArgs = process.argv.slice(2);

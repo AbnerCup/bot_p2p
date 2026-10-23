@@ -53,8 +53,14 @@ function getArgValue(flags, defaultVal) {
 }
 
 let SIMULATED_AMOUNT_USDT = parseFloat(getArgValue(['--amount', '-a'], '100')) || 100;
+// Fees de retiro USDT por red BEP-20 (BSC) — la red más barata para arbitraje cruzado.
+//   Binance BEP-20 USDT withdrawal fee:  $0.29 (fijo)
+//   Bybit BEP-20 USDT withdrawal fee:   ~$0.50 (variable, ha ido subiendo; antes $0.30)
+// Overridear con --fee X (Binance) y --bybit-fee X si cambian o para simular otras redes:
+//   TRC-20 (Tron):   Binance ~$1.00, Bybit ~$1.00
+//   Polygon:         Binance ~$0.80, Bybit ~$1.00
 let BINANCE_WITHDRAWAL_FEE = parseFloat(getArgValue(['--fee', '-f'], '0.29')) || 0.29;
-let BYBIT_WITHDRAWAL_FEE = parseFloat(getArgValue(['--bybit-fee'], '0.30')) || 0.30;
+let BYBIT_WITHDRAWAL_FEE = parseFloat(getArgValue(['--bybit-fee'], '0.50')) || 0.50;
 let MIN_NET_PROFIT_BOB = parseFloat(getArgValue(['--min-profit', '-p'], '0.10')) || 0.10;
 let ONLY_COMPATIBLE = args.includes('--strict') || args.includes('--only-compatible');
 const RUN_ONCE = args.includes('--once');
@@ -647,16 +653,19 @@ function setupKeyboardControls() {
             return;
         }
 
-        // Alternar tarifa de retiro Binance: 0.19 -> 0.24 -> 0.29 -> 0.19
+        // Alternar tarifa de retiro Binance entre redes:
+        //   0.29 (BEP-20) → 0.80 (Polygon) → 1.00 (TRC-20) → 0.29 (vuelta a BEP-20)
         if (key.name === 'f') {
-            if (BINANCE_WITHDRAWAL_FEE === 0.19) {
-                BINANCE_WITHDRAWAL_FEE = 0.24;
-            } else if (BINANCE_WITHDRAWAL_FEE === 0.24) {
-                BINANCE_WITHDRAWAL_FEE = 0.29;
+            if (BINANCE_WITHDRAWAL_FEE === 0.29) {
+                BINANCE_WITHDRAWAL_FEE = 0.80;
+                console.log(`\n🔄 Red Binance → Polygon: fee $${BINANCE_WITHDRAWAL_FEE} USDT`);
+            } else if (BINANCE_WITHDRAWAL_FEE === 0.80) {
+                BINANCE_WITHDRAWAL_FEE = 1.00;
+                console.log(`\n🔄 Red Binance → TRC-20 (Tron): fee $${BINANCE_WITHDRAWAL_FEE} USDT`);
             } else {
-                BINANCE_WITHDRAWAL_FEE = 0.19;
+                BINANCE_WITHDRAWAL_FEE = 0.29;
+                console.log(`\n🔄 Red Binance → BEP-20 (BSC): fee $${BINANCE_WITHDRAWAL_FEE} USDT`);
             }
-            console.log(`\n🔄 Tarifa de retiro Binance cambiada a: $${BINANCE_WITHDRAWAL_FEE} USDT`);
             runScanCycle();
             return;
         }
