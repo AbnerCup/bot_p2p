@@ -22,6 +22,13 @@ const { playAlertSound, toggleSoundMute, isSoundMuted } = require('./utils/sound
 const { filterEligibleAds, filterIgnoredMerchants, addIgnoredMerchant, removeIgnoredMerchant, loadIgnoredMerchants } = require('./bybit/eligibility');
 const { loadEnv } = require('./config');
 const { createRadarLogger } = require('./utils/radar_logger');
+const {
+    createTradeHistoryWriter,
+    createLegacyLoggerAdapter,
+    installFlushOnExit,
+    createCooldownGuard,
+    createTradeActionRunner
+} = require('./utils/radar_runtime');
 
 const env = loadEnv();
 
@@ -103,8 +110,7 @@ let currentActiveGap = null;
 // durante los segundos que tarda Playwright en ejecutar una orden, el usuario puede
 // pulsar teclas (nervios, impaciencia) que Node encola. Cuando la orden termina,
 // esos eventos se procesan y pueden disparar OTRA orden si no hay un gate temporal.
-let lastOrderTime = 0;
-const ORDER_COOLDOWN_MS = 5000;
+const orderCooldown = createCooldownGuard({ cooldownMs: 5000 });
 
 const HISTORY_FILE = path.join(__dirname, 'history.json');
 
@@ -147,30 +153,8 @@ let lastLoggedGapKey = null;
 let lastLoggedTime = 0;
 
 // Registrar operación ejecutada en history.json para que ejercicio.js y reportes lo tengan en cuenta
-function recordTradeInHistory({ type, cryptoAmount, price, fiatAmount, counterparty }) {
-    let history = [];
-    if (fs.existsSync(HISTORY_FILE)) {
-        try {
-            history = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-        } catch (e) {}
-    }
-    const now = new Date();
-    history.push({
-        id: `BYBIT-RADAR-${Date.now()}`,
-        date: now.toISOString().slice(0, 10),
-        timestamp: now.toISOString(),
-        type: type, // 'COMPRA' o 'VENTA'
-        cryptoAmount: parseFloat(cryptoAmount),
-        fiatAmount: parseFloat(fiatAmount),
-        price: parseFloat(price),
-        profitBob: 0,
-        bank: 'BANCO SOL',
-        counterparty: counterparty,
-        status: 'EXITOSO',
-        reason: 'Ejecutado desde Radar de Brechas Bybit'
-    });
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2), 'utf8');
-}
+// Writer compartido vía utils/radar_runtime (reemplaza ~24 líneas duplicadas)
+const recordTradeInHistory = createTradeHistoryWriter({ historyFile: HISTORY_FILE, exchange: 'bybit' });
 
 // Guardar en el historial CSV y JSON comparando Oportunidad de Compra vs Pico de Venta
 // Nuevo logger centralizado (JSONL append-only + debounce por estado + flush legacy en background)
@@ -182,20 +166,25 @@ const radarLogger = createRadarLogger({
     defaultTradeUsdt: DEFAULT_TRADE_USDT
 });
 
-// Adapter de compatibilidad con el código que seguía llamando logOpportunity().
-// - Si es ejecución (compra/venta/marcado manual) → siempre escribe (evento EXEC).
-// - Si es solo detección de brecha → delega a trackGap() que decide OPEN/UPDATE/silencio.
-function logOpportunity(opp, execution = { executed: false }) {
-    if (execution.executed) {
-        radarLogger.logExecution(opp, execution);
-    } else {
-        radarLogger.trackGap(opp);
-    }
-}
+// Adapter de compatibilidad + handlers de salida (vía utils/radar_runtime).
+const logOpportunity = createLegacyLoggerAdapter(radarLogger);
+installFlushOnExit(radarLogger);
 
-// Cerrar limpio al salir (flush del .json legacy pendiente)
-process.on('exit', () => { try { radarLogger.flushNow(); } catch (e) {} });
-process.on('SIGINT', () => { try { radarLogger.flushNow(); } catch (e) {} process.exit(0); });
+// Runner compartido para ejecutar órdenes taker (compra/venta/marcar manual).
+// Reemplaza la closure runTradeAction que estaba duplicada en ambos radars.
+const tradeActionRunner = createTradeActionRunner({
+    executor: executeBybitTakerOrder,
+    logOpportunity,
+    recordTradeInHistory,
+    cooldown: orderCooldown,
+    exchangeLabel: '',          // Bybit no agregaba sufijo "en Bybit" en el mensaje original
+    pricePrecision: 3,          // Bybit mostraba 3 decimales (BOB)
+    state: {
+        setExecutingOrder: v => { isExecutingOrder = v; },
+        setPaused:         v => { isPaused = v; },
+        setCurrentActiveGap: v => { currentActiveGap = v; }
+    }
+});
 
 /**
  * Calcula y normaliza los límites en BOB y USDT, y evalúa el solapamiento
@@ -587,12 +576,9 @@ async function startGapHunterLoop() {
         if (currentActiveGap && !isExecutingOrder) {
             // Teclas que disparan órdenes reales (c, v, Enter, m): protegidas por cooldown
             const isTradeKey = key.name === 'c' || key.name === 'v' || key.name === 'return' || key.name === 'm';
-            if (isTradeKey) {
-                const cooldownRemain = ORDER_COOLDOWN_MS - (Date.now() - lastOrderTime);
-                if (cooldownRemain > 0) {
-                    console.log(`\n⏸️ [COOLDOWN ACTIVO]: Espera ${Math.ceil(cooldownRemain / 1000)}s antes de disparar otra orden. (Tecla "${key.name}" ignorada por seguridad.)`);
-                    return;
-                }
+            if (isTradeKey && orderCooldown.isActive()) {
+                console.log(`\n⏸️ [COOLDOWN ACTIVO]: Espera ${Math.ceil(orderCooldown.remaining() / 1000)}s antes de disparar otra orden. (Tecla "${key.name}" ignorada por seguridad.)`);
+                return;
             }
 
             // Snapshot del gap ANTES de ejecutar, y limpiar currentActiveGap inmediatamente
@@ -600,42 +586,10 @@ async function startGapHunterLoop() {
             const gap = currentActiveGap;
             const tradeAmount = gap.limits?.suggestedTradeUsdt || DEFAULT_TRADE_USDT;
 
-            // Helper: ejecuta una orden Taker con guards + registro + cooldown
-            const runTradeAction = async ({ side, merchantNick, price, actionLabel }) => {
-                isExecutingOrder = true;
-                isPaused = true;
-                lastOrderTime = Date.now();     // marca inicio del cooldown
-                currentActiveGap = null;         // libera gap para no re-disparar
-
-                if (!gap.limits?.hasOverlap) {
-                    console.log('\n⚠️ [ADVERTENCIA]: Los límites no son directamente compatibles.');
-                    console.log(`Motivo: ${gap.limits?.reason}`);
-                }
-                console.log(`\n\n⚡ [ACCION DISPARADA]: Iniciando ${actionLabel} semi-automática de ${tradeAmount} USDT...`);
-
-                try {
-                    await executeBybitTakerOrder({ side, merchantNick, price, amountUsdt: tradeAmount });
-
-                    logOpportunity(gap, { executed: true, side, amountUsdt: tradeAmount });
-
-                    recordTradeInHistory({
-                        type: side === 'BUY' ? 'COMPRA' : 'VENTA',
-                        cryptoAmount: tradeAmount,
-                        price,
-                        fiatAmount: tradeAmount * price,
-                        counterparty: merchantNick
-                    });
-
-                    console.log(`\n✅ [REGISTRADO EN CSV]: ${actionLabel} registrada (${tradeAmount} USDT a ${price.toFixed(3)} BOB).`);
-                } catch (e) {
-                    console.error(`Error al ejecutar pedido ${side}:`, e.message);
-                } finally {
-                    isExecutingOrder = false;
-                    isPaused = false;
-                    lastOrderTime = Date.now();  // reinicia el cooldown DESDE EL FIN de la orden
-                    console.log(`\n▶️ Radar reanudado. Cooldown ${ORDER_COOLDOWN_MS / 1000}s activo para prevenir órdenes dobles.`);
-                }
-            };
+            // runTradeAction compartido vía utils/radar_runtime (reemplaza ~40 líneas duplicadas)
+            const runTradeAction = ({ side, merchantNick, price, actionLabel }) => tradeActionRunner({
+                gap, side, merchantNick, price, actionLabel, tradeAmount
+            });
 
             if (key.name === 'c' || key.name === 'return') {
                 await runTradeAction({
@@ -659,7 +613,7 @@ async function startGapHunterLoop() {
 
             // Tecla [m]: Marcar que se compró manualmente en Bybit (sin ejecutar Playwright)
             if (key.name === 'm') {
-                lastOrderTime = Date.now();
+                orderCooldown.stamp();
                 currentActiveGap = null;
                 logOpportunity(gap, { executed: true, side: 'BUY', amountUsdt: tradeAmount });
                 recordTradeInHistory({
