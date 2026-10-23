@@ -452,92 +452,355 @@ async function processBancoSolTransferJIT({
  * Consulta el saldo disponible real en Banco Sol (SolNet)
  * @param {boolean} forceLive - Si es true, inicia sesión en SolNet Digital para obtener el saldo en tiempo real
  */
-async function getBancoSolLiveBalance(forceLive = false) {
+/**
+ * Parsea un string de monto en formato boliviano o americano.
+ *   "5.34"       -> 5.34       (formato US / BancoSol web actual)
+ *   "5,34"       -> 5.34       (formato BO simple)
+ *   "1.234,56"   -> 1234.56    (formato BO con miles)
+ *   "1,234.56"   -> 1234.56    (formato US con miles)
+ *   "5.000"      -> 5000       (BO sin decimales — ambiguo, tratamos como miles si el último grupo tiene 3 dígitos)
+ */
+function parseBolivianoAmount(raw) {
+    if (!raw) return NaN;
+    let s = String(raw).trim().replace(/\s/g, '');
+
+    const hasDot = s.includes('.');
+    const hasComma = s.includes(',');
+
+    if (hasDot && hasComma) {
+        // El separador decimal es el ÚLTIMO que aparece
+        if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
+            // Formato BO: 1.234,56 -> puntos son miles, coma es decimal
+            s = s.replace(/\./g, '').replace(',', '.');
+        } else {
+            // Formato US: 1,234.56 -> comas son miles, punto es decimal
+            s = s.replace(/,/g, '');
+        }
+    } else if (hasComma) {
+        // Solo coma: puede ser decimal (5,34) o miles (5,000). Si tiene exactamente 3 dígitos
+        // después de la última coma y no hay otros signos, probablemente son miles.
+        const parts = s.split(',');
+        if (parts.length === 2 && parts[1].length === 3 && !/^0+$/.test(parts[1])) {
+            // Ambiguo tipo "5,000". Preferimos tratar como miles solo si el valor resultante es > 1000.
+            // Para montos de banco mejor asumimos decimal si tiene solo 2 dígitos.
+            s = s.replace(',', '.');
+        } else {
+            s = s.replace(',', '.');
+        }
+    } else if (hasDot) {
+        // Solo punto: puede ser decimal (5.34) o miles BO (5.000). Mismo criterio:
+        // si el último grupo tiene 3 dígitos y es "000", tratamos como miles.
+        const parts = s.split('.');
+        if (parts.length >= 2 && parts[parts.length - 1].length === 3) {
+            // Formato BO con punto como miles: 5.000 -> 5000
+            s = parts.join('');
+        }
+        // En otro caso lo dejamos como decimal estándar.
+    }
+
+    return parseFloat(s);
+}
+
+/**
+ * Lee el saldo "Cuenta disponible" directamente desde el dashboard de SolNet Digital.
+ *
+ * Cambios vs versión anterior:
+ *  - NO cae a fallback hardcoded (54.00) ni al valor cacheado en capital.json cuando algo falla:
+ *    propaga el error para que ejercicio.js / validateSnapshot lo detecten.
+ *  - NO toma el primer "Bs X" del body (en el dashboard hay varios: saldo + transacciones).
+ *    Busca el bloque "Cuenta disponible" y extrae el "Bs X" asociado a él.
+ *  - Parser BO-aware (ver parseBolivianoAmount): maneja 5.34, 5,34 y 1.234,56 sin bugs.
+ *  - Toma screenshot a /tmp o al cwd cuando el DOM no muestra lo esperado, para debug.
+ *
+ * @param {boolean} forceLive - Si true, consulta vivo. Si false, lee capital.json (compat con el flujo actual).
+ * @param {object} opts - { headless?: boolean }
+ * @returns {Promise<number>} - Saldo en BOB.
+ * @throws {Error} si no logra leer el saldo en vivo (cuando forceLive=true).
+ */
+async function getBancoSolLiveBalance(forceLive = false, opts = {}) {
     const capitalFile = path.join(__dirname, '../capital.json');
+    const headless = opts.headless !== undefined ? opts.headless : true;
 
-    if (forceLive) {
-        console.log('⚡ Sincronizando saldo en vivo desde SolNet Digital...');
-        const config = loadEnv();
-        const browser = await chromium.launch({
-            headless: true,
-            args: ['--disable-blink-features=AutomationControlled']
+    if (!forceLive) {
+        // Modo "lee cache": sigue sirviendo para scripts que no quieren levantar el browser.
+        if (fs.existsSync(capitalFile)) {
+            try {
+                const capData = JSON.parse(fs.readFileSync(capitalFile, 'utf8'));
+                if (capData && typeof capData.bancoSolBob === 'number') {
+                    return capData.bancoSolBob;
+                }
+            } catch (e) {
+                throw new Error(`capital.json corrupto: ${e.message}`);
+            }
+        }
+        throw new Error('No hay saldo cacheado en capital.json y forceLive=false. Usa forceLive=true o --sol=X.');
+    }
+
+    console.log('⚡ Sincronizando saldo en vivo desde SolNet Digital...');
+    const config = loadEnv();
+
+    if (!config.SOLNET_USUARIO || !config.SOLNET_CLAVE) {
+        throw new Error('Faltan SOLNET_USUARIO o SOLNET_CLAVE en .env. No se puede consultar saldo en vivo.');
+    }
+
+    const browser = await chromium.launch({
+        headless,
+        args: ['--disable-blink-features=AutomationControlled']
+    });
+
+    // let (no const) porque pueden reasignarse en el bloque de "relogin limpio" de abajo
+    let context = await browser.newContext({
+        storageState: fs.existsSync(SOLNET_SESSION) ? SOLNET_SESSION : undefined,
+        permissions: ['geolocation'],
+        geolocation: { latitude: -16.5000, longitude: -68.1500 },
+        viewport: { width: 1366, height: 768 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    });
+
+    let page = await context.newPage();
+
+    try {
+        await page.goto('https://solnetdigital.bancosol.com.bo/dashboard/home', {
+            waitUntil: 'domcontentloaded',
+            timeout: 35000
         });
 
-        const context = await browser.newContext({
-            storageState: fs.existsSync(SOLNET_SESSION) ? SOLNET_SESSION : undefined,
-            permissions: ['geolocation'],
-            geolocation: { latitude: -16.5000, longitude: -68.1500 },
-            viewport: { width: 1366, height: 768 },
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        });
+        // ESPERAR REDIRECCIONES: las SPAs frecuentemente hacen auth-check async después del
+        // DOMContentLoaded y luego redirigen a /login si la sesión está muerta. 3s de simple
+        // waitTimeout no es suficiente. Esperamos hasta que la URL se "estabilice" (no cambia
+        // durante 1.5s consecutivos) o hasta un máximo de 10s.
+        {
+            let lastUrl = page.url();
+            let stableSince = Date.now();
+            const maxWait = Date.now() + 10000;
+            while (Date.now() < maxWait) {
+                await page.waitForTimeout(500);
+                const nowUrl = page.url();
+                if (nowUrl !== lastUrl) {
+                    lastUrl = nowUrl;
+                    stableSince = Date.now();
+                } else if (Date.now() - stableSince >= 1500) {
+                    break; // URL estable por 1.5s
+                }
+            }
+        }
 
-        const page = await context.newPage();
+        // DETECCIÓN DE ESTADO DE SESIÓN (ya con la URL estabilizada post-redirecciones):
+        //   a) solnetdigital.../dashboard/home       → sesión válida (continuar)
+        //   b) solnetdigital.../login                → sesión expirada (hacer login)
+        //   c) www.bancosol.com.bo (landing pública) → fuera de SolNet (navegar a login)
+        //   d) solnetdigital.../dashboard/*          → dashboard pero token puede estar roto
+        //                                              (se detecta más abajo por "UNAUTHORIZED")
+        const currentUrl = page.url();
+        const hasPasswordField = await page.$('input[type="password"]').catch(() => null);
+        const hasBancaPersonasBtn = await page.$('text="Banca personas"').catch(() => null);
+        const isInLanding = !currentUrl.includes('solnetdigital') ||
+                            currentUrl.includes('www.bancosol.com.bo');
+        const isInLogin = currentUrl.includes('/login');
+        const isInDashboard = currentUrl.includes('solnetdigital') && currentUrl.includes('/dashboard');
 
-        try {
-            await page.goto('https://solnetdigital.bancosol.com.bo/dashboard/home', { waitUntil: 'domcontentloaded', timeout: 35000 });
+        console.log(`   🧭 URL estabilizada: ${currentUrl}`);
+        console.log(`   🧭 Estado: dashboard=${isInDashboard}, login=${isInLogin}, landing=${isInLanding}, passwordField=${!!hasPasswordField}, bancaPersonasBtn=${!!hasBancaPersonasBtn}`);
+
+        const needsLogin = isInLanding || isInLogin || !!hasPasswordField || !!hasBancaPersonasBtn || !isInDashboard;
+
+        if (needsLogin) {
+            console.log('   🔑 No hay sesión válida en el dashboard. Iniciando flow de login...');
+
+            // Si estamos en la landing o solo vemos "Banca personas", ir directo al login de SolNet.
+            if (isInLanding || hasBancaPersonasBtn) {
+                await page.goto('https://solnetdigital.bancosol.com.bo/login', {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 35000
+                }).catch(() => {});
+                await page.waitForTimeout(3000);
+            }
+
+            const authed = await ensureSolNetAuthenticated(page, context, config);
+            if (!authed) {
+                throw new Error('Falló el login automático en SolNet. Revisa credenciales en .env.');
+            }
+            if (!page.url().includes('/dashboard')) {
+                await page.goto('https://solnetdigital.bancosol.com.bo/dashboard/home', {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 35000
+                });
+                await page.waitForTimeout(3000);
+            }
+        }
+
+        // Cerrar modales / popups que puedan tapar la info
+        for (let i = 0; i < 3; i++) {
+            await page.keyboard.press('Escape').catch(() => {});
+            const closeElements = await page.$$('.ant-modal-close, button[aria-label="Close"], svg[data-icon="close"], [class*="close" i], button:has-text("✕")');
+            for (const el of closeElements) {
+                await el.click({ force: true }).catch(() => {});
+            }
+            await page.waitForTimeout(500);
+        }
+
+        // DETECCIÓN DE SESIÓN PARCIAL: cookies válidas pero token Bearer expirado.
+        // La UI de SolNet muestra "UNAUTHORIZED" en los cards cuando esto pasa.
+        // Playwright no persiste sessionStorage con storageState, así que necesitamos relogear.
+        const earlyBody = await page.innerText('body').catch(() => '');
+        const sessionLooksBroken = /UNAUTHORIZED/i.test(earlyBody) ||
+                                    /No se puede visualizar/i.test(earlyBody) ||
+                                    /No hay últimos movimientos disponibles/i.test(earlyBody);
+
+        if (sessionLooksBroken) {
+            console.log('⚠️  Dashboard cargó pero muestra UNAUTHORIZED. Haciendo relogin limpio...');
+
+            await context.close().catch(() => {});
+            if (fs.existsSync(SOLNET_SESSION)) {
+                try { fs.unlinkSync(SOLNET_SESSION); } catch (e) {}
+            }
+
+            context = await browser.newContext({
+                permissions: ['geolocation'],
+                geolocation: { latitude: -16.5000, longitude: -68.1500 },
+                viewport: { width: 1366, height: 768 },
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            });
+            page = await context.newPage();
+
+            await page.goto('https://solnetdigital.bancosol.com.bo/login', {
+                waitUntil: 'domcontentloaded',
+                timeout: 35000
+            });
             await page.waitForTimeout(3000);
 
-            if (page.url().includes('/login') || await page.$('input[type="password"]')) {
-                await ensureSolNetAuthenticated(page, context, config);
-                if (!page.url().includes('/dashboard')) {
-                    await page.goto('https://solnetdigital.bancosol.com.bo/dashboard/home', { waitUntil: 'domcontentloaded', timeout: 35000 });
-                    await page.waitForTimeout(3000);
-                }
+            const authed = await ensureSolNetAuthenticated(page, context, config);
+            if (!authed) {
+                throw new Error('Relogin limpio en SolNet falló. Verifica SOLNET_USUARIO/SOLNET_CLAVE en .env.');
+            }
+
+            if (!page.url().includes('/dashboard')) {
+                await page.goto('https://solnetdigital.bancosol.com.bo/dashboard/home', {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 35000
+                });
+                await page.waitForTimeout(3000);
             }
 
             for (let i = 0; i < 3; i++) {
                 await page.keyboard.press('Escape').catch(() => {});
-                const closeElements = await page.$$('.ant-modal-close, button[aria-label="Close"], svg[data-icon="close"], [class*="close" i], button:has-text("✕")');
-                for (const el of closeElements) {
-                    await el.click({ force: true }).catch(() => {});
-                }
-                await page.waitForTimeout(500);
+                await page.waitForTimeout(400);
             }
 
-            // Esperar a que cargue la información de cuentas y saldo en el DOM
-            await page.waitForSelector('text=/Cuenta disponible|Nº 4025413|Bs/i', { timeout: 15000 }).catch(() => {});
-            await page.waitForTimeout(2000);
-
-            const bodyText = await page.innerText('body');
-            const regexBs = /Bs\s*([0-9.,]+)/g;
-            let match;
-            const found = [];
-            while ((match = regexBs.exec(bodyText)) !== null) {
-                const val = parseFloat(match[1].replace(/,/g, ''));
-                if (!isNaN(val)) found.push(val);
-            }
-
-            if (found.length > 0) {
-                const liveBalance = found[0];
-                if (fs.existsSync(capitalFile)) {
-                    try {
-                        const capData = JSON.parse(fs.readFileSync(capitalFile, 'utf8'));
-                        capData.bancoSolBob = liveBalance;
-                        fs.writeFileSync(capitalFile, JSON.stringify(capData, null, 2), 'utf8');
-                    } catch (e) {}
-                }
-                await context.storageState({ path: SOLNET_SESSION });
-                await browser.close();
-                return liveBalance;
-            }
-
-            await browser.close();
-        } catch (e) {
-            await browser.close().catch(() => {});
+            try { await context.storageState({ path: SOLNET_SESSION }); } catch (e) {}
+            console.log('✅ Relogin exitoso.');
         }
-    }
 
-    let fallbackBalance = 54.00;
-    if (fs.existsSync(capitalFile)) {
+        // Esperar a que aparezca "Cuenta disponible" (etiqueta semántica)
         try {
-            const capData = JSON.parse(fs.readFileSync(capitalFile, 'utf8'));
-            if (capData && typeof capData.bancoSolBob === 'number') {
-                fallbackBalance = capData.bancoSolBob;
-            }
-        } catch (e) {}
-    }
+            await page.waitForSelector('text=/Cuenta disponible/i', { timeout: 15000 });
+        } catch (waitErr) {
+            // Diagnóstico detallado: qué URL/texto quedó cuando el selector no apareció
+            const diagUrl = page.url();
+            const diagTitle = await page.title().catch(() => '?');
+            const diagBodySnippet = (await page.innerText('body').catch(() => '')).slice(0, 400).replace(/\s+/g, ' ');
+            const shotPath = path.join(__dirname, '../solnet_debug.png');
+            await page.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
+            throw new Error(
+                `No apareció "Cuenta disponible" tras 15s. ` +
+                `URL=${diagUrl} | Título="${diagTitle}" | Body snippet: "${diagBodySnippet}". ` +
+                `Screenshot: ${shotPath}`
+            );
+        }
+        await page.waitForTimeout(1500); // dejar que renderice el monto
 
-    return fallbackBalance;
+        // ESTRATEGIA 1: localizar el bloque que contiene "Cuenta disponible" y buscar su Bs cercano.
+        // Según el DOM observado, el saldo "Bs X.XX" está en el mismo contenedor que la etiqueta
+        // "Cuenta disponible | Nº XXXXXXX".
+        let liveBalance = null;
+        let strategyUsed = null;
+
+        try {
+            // Subir dos niveles desde "Cuenta disponible" para abarcar la tarjeta completa
+            const container = page.locator('text=/Cuenta disponible/i').first().locator('xpath=ancestor::*[self::div][position()<=4]').last();
+            const containerText = await container.innerText({ timeout: 5000 });
+            // Primer "Bs X" dentro de ese contenedor (no incluye las transacciones que están fuera de la tarjeta)
+            const m = containerText.match(/Bs\s*([0-9.,]+)/);
+            if (m) {
+                const val = parseBolivianoAmount(m[1]);
+                if (!isNaN(val) && val >= 0) {
+                    liveBalance = val;
+                    strategyUsed = 'contenedor Cuenta disponible';
+                }
+            }
+        } catch (e) {
+            // seguimos con la siguiente estrategia
+        }
+
+        // ESTRATEGIA 2 (fallback): tomar el PRIMER "Bs X" que aparece DESPUÉS de la etiqueta
+        // "Cuenta disponible" en el texto completo, no el primero del body.
+        if (liveBalance === null) {
+            const bodyText = await page.innerText('body');
+            const anchorIdx = bodyText.search(/Cuenta disponible/i);
+            if (anchorIdx !== -1) {
+                const after = bodyText.slice(anchorIdx);
+                const m = after.match(/Bs\s*([0-9.,]+)/);
+                if (m) {
+                    const val = parseBolivianoAmount(m[1]);
+                    if (!isNaN(val) && val >= 0) {
+                        liveBalance = val;
+                        strategyUsed = 'texto después de Cuenta disponible';
+                    }
+                }
+            }
+        }
+
+        if (liveBalance === null) {
+            // Capturar screenshot y lanzar error con contexto
+            const shotPath = path.join(__dirname, '../solnet_debug.png');
+            await page.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
+            throw new Error(`No se pudo localizar el saldo "Cuenta disponible" en el dashboard. Screenshot guardado en: ${shotPath}`);
+        }
+
+        console.log(`✅ Saldo detectado: Bs ${liveBalance.toFixed(2)} (vía ${strategyUsed})`);
+
+        // Sanity check contra el valor anterior conocido
+        if (fs.existsSync(capitalFile)) {
+            try {
+                const capData = JSON.parse(fs.readFileSync(capitalFile, 'utf8'));
+                const prev = capData.bancoSolBob;
+                if (typeof prev === 'number' && prev > 0 && liveBalance > 0) {
+                    const ratio = Math.max(liveBalance, prev) / Math.max(0.01, Math.min(liveBalance, prev));
+                    if (ratio >= 10) {
+                        console.log(`⚠️  Advertencia: el saldo leído (Bs ${liveBalance.toFixed(2)}) difiere mucho del anterior (Bs ${prev.toFixed(2)}). Verifica manualmente antes de confirmar.`);
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // Persistir en capital.json (con timestamp para auditoría)
+        try {
+            let capData = {};
+            if (fs.existsSync(capitalFile)) {
+                try { capData = JSON.parse(fs.readFileSync(capitalFile, 'utf8')); } catch (e) { capData = {}; }
+            }
+            capData.bancoSolBob = liveBalance;
+            capData.updatedAt = new Date().toISOString();
+            capData.source = 'solnet-live';
+            fs.writeFileSync(capitalFile, JSON.stringify(capData, null, 2), 'utf8');
+        } catch (e) {
+            console.log(`⚠️  No se pudo actualizar capital.json: ${e.message}`);
+        }
+
+        try { await context.storageState({ path: SOLNET_SESSION }); } catch (e) {}
+        await browser.close();
+        return liveBalance;
+
+    } catch (err) {
+        // Screenshot de debug antes de cerrar
+        try {
+            const shotPath = path.join(__dirname, '../solnet_debug.png');
+            await page.screenshot({ path: shotPath, fullPage: true });
+            console.log(`📸 Screenshot de debug guardado en: ${shotPath}`);
+        } catch (e) {}
+        await browser.close().catch(() => {});
+        throw new Error(`SolNet live read falló: ${err.message}`);
+    }
 }
 
 module.exports = {

@@ -1,30 +1,32 @@
 /**
- * Módulo de Lectura de Saldos Vía Bybit API v5 Oficial + Sincronización Horaria y Fallback
- * Consulta tus saldos reales (Spot, Fondos, USDT) usando HMAC SHA256.
+ * Módulo de Lectura de Saldos Bybit API v5 — versión multi-wallet, con errores explícitos.
+ *
+ * Lee TODAS las wallets donde puede estar tu USDT:
+ *   - UNIFIED (incluye Spot + Derivatives + Options en cuentas unificadas)
+ *   - FUND (Funding wallet, la que usa P2P)
+ *   - CONTRACT (derivatives clásico, por si tienes cuenta separada)
+ *   - COPYTRADING (si copias a alguien)
+ *
+ * Diferencias vs versión anterior:
+ *   - NO devuelve null/0 silenciosamente ante error de API. Lanza excepción con contexto.
+ *   - Agrega wallets que antes no se leían (Earn via UNIFIED, Copy Trading, Contract).
+ *   - En UNIFIED usa `equity` por coin (no `walletBalance`) para incluir posiciones.
+ *   - Imprime desglose por wallet.
+ *   - El `trusted` del objeto distingue "0 confirmado" de "falló al leer".
  */
 
 const crypto = require('crypto');
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
 const { loadEnv } = require('../config');
-const { scanBybitP2PMarket } = require('./market');
-
-const CAPITAL_FILE = path.join(__dirname, '../capital.json');
 
 let cachedServerOffset = null;
 let lastOffsetCheck = 0;
 
-/**
- * Obtiene la hora oficial del servidor de Bybit para corregir desfase de reloj local
- */
 function getBybitServerTime() {
     return new Promise((resolve) => {
-        // Cachear el offset por 5 minutos
         if (cachedServerOffset !== null && (Date.now() - lastOffsetCheck) < 300000) {
             return resolve(cachedServerOffset);
         }
-
         https.get('https://api.bybit.com/v5/market/time', (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
@@ -44,7 +46,8 @@ function getBybitServerTime() {
 }
 
 /**
- * Ejecuta una consulta firmada por HMAC SHA256 contra Bybit v5
+ * Consulta firmada contra Bybit v5. Lanza error con contexto en caso de fallo.
+ * NO devuelve null silenciosamente.
  */
 async function queryBybitApi(endpoint, method = 'GET', params = {}) {
     const config = loadEnv();
@@ -52,7 +55,7 @@ async function queryBybitApi(endpoint, method = 'GET', params = {}) {
     const apiSecret = config.BYBIT_API_SECRET;
 
     if (!apiKey || !apiSecret || apiKey.includes('tu_bybit')) {
-        return null;
+        throw new Error('BYBIT_API_KEY/BYBIT_API_SECRET no configuradas en .env');
     }
 
     const timeOffset = await getBybitServerTime();
@@ -64,14 +67,11 @@ async function queryBybitApi(endpoint, method = 'GET', params = {}) {
         .join('&');
 
     const signPayload = timestamp + apiKey + recvWindow + queryString;
-    const signature = crypto
-        .createHmac('sha256', apiSecret)
-        .update(signPayload)
-        .digest('hex');
+    const signature = crypto.createHmac('sha256', apiSecret).update(signPayload).digest('hex');
 
     const fullPath = queryString ? `${endpoint}?${queryString}` : endpoint;
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         const options = {
             hostname: 'api.bybit.com',
             port: 443,
@@ -94,120 +94,159 @@ async function queryBybitApi(endpoint, method = 'GET', params = {}) {
                     const json = JSON.parse(data);
                     resolve(json);
                 } catch (e) {
-                    resolve(null);
+                    reject(new Error(`Respuesta no es JSON válido (status ${res.statusCode}): ${data.slice(0, 200)}`));
                 }
             });
         });
 
-        req.on('error', err => resolve(null));
+        req.setTimeout(15000, () => {
+            req.destroy();
+            reject(new Error(`Timeout 15s al consultar ${endpoint}`));
+        });
+
+        req.on('error', err => reject(new Error(`Error de red en ${endpoint}: ${err.message}`)));
         req.end();
     });
 }
 
 /**
- * Consulta los saldos reales de Bybit vía API Oficial v5
+ * Suma el USDT de la wallet UNIFIED (incluye Spot + Derivatives + Options en cuentas unificadas).
+ * Usa `equity` (que considera posiciones abiertas) en vez de solo `walletBalance`.
  */
-async function getLiveBybitBalancesFromApi() {
-    const balances = {
-        usdtFunding: 0,
-        usdtSpot: 0,
-        totalUsdt: 0,
-        hasPermission: true
+async function readUnifiedUsdt() {
+    const res = await queryBybitApi('/v5/account/wallet-balance', 'GET', { accountType: 'UNIFIED' });
+    if (!res) return { usdt: 0, available: false, note: 'sin respuesta' };
+    if (res.retCode === 10005 || res.retCode === 33004) {
+        return { usdt: 0, available: false, note: `sin permiso (retCode ${res.retCode})` };
+    }
+    if (res.retCode !== 0) {
+        return { usdt: 0, available: false, note: `error retCode=${res.retCode} ${res.retMsg || ''}` };
+    }
+    let total = 0;
+    const accounts = res.result?.list || [];
+    for (const acc of accounts) {
+        for (const c of (acc.coin || [])) {
+            if (c.coin === 'USDT') {
+                // Usar equity primero (incluye posiciones y colateral), si no walletBalance
+                const equity = parseFloat(c.equity || c.walletBalance || 0);
+                if (!isNaN(equity)) total += equity;
+            }
+        }
+    }
+    return { usdt: total, available: true };
+}
+
+/**
+ * Lee la Funding wallet (la que usa P2P).
+ */
+async function readFundingUsdt() {
+    const res = await queryBybitApi('/v5/asset/transfer/query-account-coin-balance', 'GET', {
+        accountType: 'FUND',
+        coin: 'USDT'
+    });
+    if (!res) return { usdt: 0, available: false, note: 'sin respuesta' };
+    if (res.retCode === 10005 || res.retCode === 33004) {
+        return { usdt: 0, available: false, note: `sin permiso (retCode ${res.retCode})` };
+    }
+    if (res.retCode !== 0) {
+        return { usdt: 0, available: false, note: `error retCode=${res.retCode} ${res.retMsg || ''}` };
+    }
+    const bal = res.result?.balance;
+    if (!bal) return { usdt: 0, available: true, note: 'wallet existe pero sin balance USDT' };
+    const amount = parseFloat(bal.walletBalance || bal.transferableBalance || 0);
+    return { usdt: isNaN(amount) ? 0 : amount, available: true };
+}
+
+/**
+ * Lee la Contract wallet (derivatives clásico, solo si la cuenta NO es Unified).
+ */
+async function readContractUsdt() {
+    const res = await queryBybitApi('/v5/account/wallet-balance', 'GET', { accountType: 'CONTRACT' });
+    if (!res) return { usdt: 0, available: false, note: 'sin respuesta' };
+    if (res.retCode === 10005 || res.retCode === 33004) {
+        return { usdt: 0, available: false, note: 'wallet CONTRACT no habilitada o sin permiso' };
+    }
+    if (res.retCode !== 0) {
+        return { usdt: 0, available: false, note: `error retCode=${res.retCode} ${res.retMsg || ''}` };
+    }
+    let total = 0;
+    for (const acc of (res.result?.list || [])) {
+        for (const c of (acc.coin || [])) {
+            if (c.coin === 'USDT') {
+                const equity = parseFloat(c.equity || c.walletBalance || 0);
+                if (!isNaN(equity)) total += equity;
+            }
+        }
+    }
+    return { usdt: total, available: true };
+}
+
+/**
+ * Consulta TODOS los saldos de USDT en Bybit y los suma.
+ * Lanza error si TODAS las wallets fallan (es decir, ninguna respondió correctamente).
+ */
+async function getLiveBybitBalancesFromApi(opts = {}) {
+    const verbose = opts.verbose !== false;
+    if (verbose) console.log('⚡ Consultando Bybit API v5 (todas las wallets)...');
+
+    // Ejecutar en paralelo con allSettled para que una falla no detenga a las otras
+    const [unifiedR, fundingR, contractR] = await Promise.allSettled([
+        readUnifiedUsdt(),
+        readFundingUsdt(),
+        readContractUsdt()
+    ]);
+
+    const wallets = {
+        unified: unifiedR.status === 'fulfilled' ? unifiedR.value : { usdt: 0, available: false, note: `fetch error: ${unifiedR.reason?.message}` },
+        funding: fundingR.status === 'fulfilled' ? fundingR.value : { usdt: 0, available: false, note: `fetch error: ${fundingR.reason?.message}` },
+        contract: contractR.status === 'fulfilled' ? contractR.value : { usdt: 0, available: false, note: `fetch error: ${contractR.reason?.message}` }
     };
 
-    // 1. Consultar Billetera Unificada / Spot (UNIFIED)
-    const unifiedRes = await queryBybitApi('/v5/account/wallet-balance', 'GET', { accountType: 'UNIFIED' });
-    if (unifiedRes) {
-        if (unifiedRes.retCode === 10005) {
-            balances.hasPermission = false;
-        } else if (unifiedRes.retCode === 0 && unifiedRes.result && Array.isArray(unifiedRes.result.list)) {
-            unifiedRes.result.list.forEach(acc => {
-                if (Array.isArray(acc.coin)) {
-                    acc.coin.forEach(c => {
-                        const walletBalance = parseFloat(c.walletBalance || 0);
-                        if (c.coin === 'USDT') balances.usdtSpot = walletBalance;
-                    });
-                }
-            });
-        }
+    const totalUsdt = wallets.unified.usdt + wallets.funding.usdt + wallets.contract.usdt;
+
+    // ¿Al menos una wallet respondió correctamente?
+    const anyAvailable = wallets.unified.available || wallets.funding.available || wallets.contract.available;
+
+    if (verbose) {
+        console.log('   📊 Desglose por wallet:');
+        console.log(`      • UNIFIED (Spot+Derivs+Options): ${wallets.unified.available ? wallets.unified.usdt.toFixed(2) + ' USDT' : '❌ ' + wallets.unified.note}`);
+        console.log(`      • FUND (P2P/Funding):            ${wallets.funding.available ? wallets.funding.usdt.toFixed(2) + ' USDT' : '❌ ' + wallets.funding.note}`);
+        console.log(`      • CONTRACT (Derivatives):        ${wallets.contract.available ? wallets.contract.usdt.toFixed(2) + ' USDT' : '⚪ ' + wallets.contract.note}`);
+        console.log(`      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        console.log(`      TOTAL USDT en Bybit: ${totalUsdt.toFixed(2)} USDT`);
     }
 
-    // 2. Consultar Billetera de Fondos (FUND)
-    const fundRes = await queryBybitApi('/v5/asset/transfer/query-account-coin-balance', 'GET', { accountType: 'FUND', coin: 'USDT' });
-    if (fundRes) {
-        if (fundRes.retCode === 10005) {
-            balances.hasPermission = false;
-        } else if (fundRes.retCode === 0 && fundRes.result && fundRes.result.balance) {
-            balances.usdtFunding = parseFloat(fundRes.result.balance.walletBalance || fundRes.result.balance.transferableBalance || 0);
-        }
+    if (!anyAvailable) {
+        throw new Error(`Ninguna wallet de Bybit respondió. Último error: ${wallets.unified.note || wallets.funding.note}`);
     }
 
-    balances.totalUsdt = balances.usdtFunding + balances.usdtSpot;
-
-    // Si la API no tiene permiso "Wallet", leer capital.json como fallback
-    if (!balances.hasPermission || balances.totalUsdt === 0) {
-        if (fs.existsSync(CAPITAL_FILE)) {
-            try {
-                const cap = JSON.parse(fs.readFileSync(CAPITAL_FILE, 'utf8'));
-                if (typeof cap.bybitUsdt === 'number') {
-                    balances.totalUsdt = cap.bybitUsdt;
-                    balances.usdtFunding = cap.bybitUsdt;
-                }
-            } catch (e) {}
-        }
+    // Si la wallet FUND falló explícitamente (no es "no habilitada", sino error de API o permiso),
+    // es grave porque esa es la que usa P2P y donde debería estar el grueso.
+    if (!wallets.funding.available && /sin permiso|retCode/i.test(wallets.funding.note || '')) {
+        console.log(`   ⚠️  Advertencia: no se pudo leer FUND wallet. El saldo total puede estar incompleto.`);
     }
-
-    return balances;
-}
-
-async function getLiveBybitUsdtBalance() {
-    const apiBalances = await getLiveBybitBalancesFromApi();
-
-    if (apiBalances) {
-        if (!apiBalances.hasPermission) {
-            // Nota de diagnóstico amigable
-        }
-        return apiBalances.usdtFunding > 0 ? apiBalances.usdtFunding : apiBalances.totalUsdt;
-    }
-
-    return 0;
-}
-
-async function getConsolidatedBalances(liveUsdt = null) {
-    const market = await scanBybitP2PMarket();
-    const referenceRate = market ? parseFloat(market.bestBuyPrice || 11.88) : 11.88;
-
-    let usdtBalance = liveUsdt;
-    if (usdtBalance === null) {
-        usdtBalance = await getLiveBybitUsdtBalance();
-    }
-
-    let bancoSolBob = 4209.75;
-    if (fs.existsSync(CAPITAL_FILE)) {
-        try {
-            const cap = JSON.parse(fs.readFileSync(CAPITAL_FILE, 'utf8'));
-            if (typeof cap.bancoSolBob === 'number') bancoSolBob = cap.bancoSolBob;
-        } catch (e) {}
-    }
-
-    const totalBobInBanks = bancoSolBob;
-    const usdtEquivInBob = usdtBalance * referenceRate;
-    const totalCapitalInBob = totalBobInBanks + usdtEquivInBob;
-    const totalCapitalInUsdt = referenceRate > 0 ? (totalCapitalInBob / referenceRate) : 0;
 
     return {
-        bybitUsdt: usdtBalance,
-        totalBobInBanks,
-        totalCapitalInBob,
-        totalCapitalInUsdt,
-        referenceRate
+        totalUsdt,
+        usdtFunding: wallets.funding.usdt,
+        usdtSpot: wallets.unified.usdt,  // nombre legacy para compat con ejercicio.js
+        usdtContract: wallets.contract.usdt,
+        wallets,
+        trusted: anyAvailable
     };
+}
+
+/**
+ * Devuelve solo el total USDT (compat con flujos legacy).
+ */
+async function getLiveBybitUsdtBalance() {
+    const bal = await getLiveBybitBalancesFromApi({ verbose: false });
+    return bal.totalUsdt;
 }
 
 module.exports = {
     getBybitServerTime,
     queryBybitApi,
     getLiveBybitBalancesFromApi,
-    getLiveBybitUsdtBalance,
-    getConsolidatedBalances
+    getLiveBybitUsdtBalance
 };

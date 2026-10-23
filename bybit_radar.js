@@ -21,6 +21,7 @@ const { executeBybitTakerOrder } = require('./bybit/taker_execution');
 const { playAlertSound, toggleSoundMute, isSoundMuted } = require('./utils/sound');
 const { filterEligibleAds, filterIgnoredMerchants, addIgnoredMerchant, removeIgnoredMerchant, loadIgnoredMerchants } = require('./bybit/eligibility');
 const { loadEnv } = require('./config');
+const { createRadarLogger } = require('./utils/radar_logger');
 
 const env = loadEnv();
 
@@ -77,6 +78,13 @@ let scanCount = 0;
 let opportunitiesCount = 0;
 let lastAlertTime = null;
 let currentActiveGap = null;
+
+// Cooldown post-ejecución para prevenir disparos accidentales:
+// durante los segundos que tarda Playwright en ejecutar una orden, el usuario puede
+// pulsar teclas (nervios, impaciencia) que Node encola. Cuando la orden termina,
+// esos eventos se procesan y pueden disparar OTRA orden si no hay un gate temporal.
+let lastOrderTime = 0;
+const ORDER_COOLDOWN_MS = 5000;
 
 const HISTORY_FILE = path.join(__dirname, 'history.json');
 
@@ -145,88 +153,29 @@ function recordTradeInHistory({ type, cryptoAmount, price, fiatAmount, counterpa
 }
 
 // Guardar en el historial CSV y JSON comparando Oportunidad de Compra vs Pico de Venta
+// Nuevo logger centralizado (JSONL append-only + debounce por estado + flush legacy en background)
+const radarLogger = createRadarLogger({
+    exchange: 'bybit',
+    csvPath: HISTORY_CSV,
+    jsonPath: HISTORY_JSON,
+    jsonlDir: __dirname,
+    defaultTradeUsdt: DEFAULT_TRADE_USDT
+});
+
+// Adapter de compatibilidad con el código que seguía llamando logOpportunity().
+// - Si es ejecución (compra/venta/marcado manual) → siempre escribe (evento EXEC).
+// - Si es solo detección de brecha → delega a trackGap() que decide OPEN/UPDATE/silencio.
 function logOpportunity(opp, execution = { executed: false }) {
-    initHistoryCSV();
-    const now = new Date();
-    const dateStr = now.toLocaleString('es-BO', { timeZone: 'America/La_Paz' });
-
-    const l = opp.limits;
-    const compatStr = l.hasOverlap ? 'COMPATIBLE' : 'INCOMPATIBLE';
-    const tradeUsdt = execution.amountUsdt || l.suggestedTradeUsdt || DEFAULT_TRADE_USDT;
-
-    let tipoRegistro = 'OPORTUNIDAD_DETECTADA';
-    let compreEnOportunidad = 'NO';
-    let totalBob = parseFloat((tradeUsdt * opp.buyPrice).toFixed(2));
-    let gananciaEstimadaBob = parseFloat((opp.spread * tradeUsdt).toFixed(2));
-
     if (execution.executed) {
-        if (execution.side === 'BUY') {
-            tipoRegistro = 'COMPRA_EJECUTADA';
-            compreEnOportunidad = 'SI';
-            totalBob = parseFloat((tradeUsdt * opp.buyPrice).toFixed(2));
-        } else if (execution.side === 'SELL') {
-            tipoRegistro = 'VENTA_EJECUTADA';
-            compreEnOportunidad = 'VENTA_REALIZADA';
-            totalBob = parseFloat((tradeUsdt * opp.sellPrice).toFixed(2));
-        }
+        radarLogger.logExecution(opp, execution);
     } else {
-        // Debounce: evitar escribir filas duplicadas cada 800ms para la misma oportunidad
-        const gapKey = `${opp.seller.nickName}_${opp.buyPrice}_${opp.buyer.nickName}_${opp.sellPrice}`;
-        if (lastLoggedGapKey === gapKey && (Date.now() - lastLoggedTime) < 45000) {
-            return;
-        }
-        lastLoggedGapKey = gapKey;
-        lastLoggedTime = Date.now();
+        radarLogger.trackGap(opp);
     }
-
-    const row = [
-        `"${dateStr}"`,
-        `"${tipoRegistro}"`,
-        `"${compreEnOportunidad}"`,
-        opp.buyPrice,
-        `"${opp.seller.nickName}"`,
-        opp.sellPrice,
-        `"${opp.buyer.nickName}"`,
-        opp.spread,
-        `"${opp.marginPercent}%"`,
-        tradeUsdt,
-        totalBob,
-        gananciaEstimadaBob,
-        `"${l.buy.minBob.toFixed(2)} - ${l.buy.maxBob.toFixed(2)} BOB"`,
-        `"${l.sell.minBob.toFixed(2)} - ${l.sell.maxBob.toFixed(2)} BOB"`,
-        `"${compatStr}"`,
-        `"Oportunidad compra a ${opp.buyPrice.toFixed(3)} (${opp.seller.nickName}) vs pico venta a ${opp.sellPrice.toFixed(3)} (${opp.buyer.nickName})"`
-    ].join(';');
-
-    fs.appendFileSync(HISTORY_CSV, row + '\n', 'utf8');
-
-    try {
-        let jsonHistory = [];
-        if (fs.existsSync(HISTORY_JSON)) {
-            jsonHistory = JSON.parse(fs.readFileSync(HISTORY_JSON, 'utf8'));
-        }
-        jsonHistory.push({
-            timestamp: now.toISOString(),
-            date: dateStr,
-            tipoRegistro: tipoRegistro,
-            compreEnOportunidad: compreEnOportunidad,
-            oportunidadCompraBob: opp.buyPrice,
-            vendedor: opp.seller.nickName,
-            picoVentaBob: opp.sellPrice,
-            compradorPico: opp.buyer.nickName,
-            spreadBob: opp.spread,
-            margenPercent: opp.marginPercent,
-            cantidadUsdt: tradeUsdt,
-            totalBob: totalBob,
-            gananciaEstimadaBob: gananciaEstimadaBob,
-            limits: l
-        });
-        if (jsonHistory.length > 500) {
-            jsonHistory = jsonHistory.slice(-500);
-        }
-        fs.writeFileSync(HISTORY_JSON, JSON.stringify(jsonHistory, null, 2), 'utf8');
-    } catch (e) {}
 }
+
+// Cerrar limpio al salir (flush del .json legacy pendiente)
+process.on('exit', () => { try { radarLogger.flushNow(); } catch (e) {} });
+process.on('SIGINT', () => { try { radarLogger.flushNow(); } catch (e) {} process.exit(0); });
 
 /**
  * Calcula y normaliza los límites en BOB y USDT, y evalúa el solapamiento
@@ -602,115 +551,100 @@ async function startGapHunterLoop() {
 
         // Si hay una brecha activa y el usuario confirma compra o venta
         if (currentActiveGap && !isExecutingOrder) {
-            const tradeAmount = currentActiveGap.limits?.suggestedTradeUsdt || DEFAULT_TRADE_USDT;
+            // Teclas que disparan órdenes reales (c, v, Enter, m): protegidas por cooldown
+            const isTradeKey = key.name === 'c' || key.name === 'v' || key.name === 'return' || key.name === 'm';
+            if (isTradeKey) {
+                const cooldownRemain = ORDER_COOLDOWN_MS - (Date.now() - lastOrderTime);
+                if (cooldownRemain > 0) {
+                    console.log(`\n⏸️ [COOLDOWN ACTIVO]: Espera ${Math.ceil(cooldownRemain / 1000)}s antes de disparar otra orden. (Tecla "${key.name}" ignorada por seguridad.)`);
+                    return;
+                }
+            }
 
-            if (key.name === 'c' || key.name === 'return') {
+            // Snapshot del gap ANTES de ejecutar, y limpiar currentActiveGap inmediatamente
+            // para que los eventos encolados durante Playwright no se disparen contra el mismo gap.
+            const gap = currentActiveGap;
+            const tradeAmount = gap.limits?.suggestedTradeUsdt || DEFAULT_TRADE_USDT;
+
+            // Helper: ejecuta una orden Taker con guards + registro + cooldown
+            const runTradeAction = async ({ side, merchantNick, price, actionLabel }) => {
                 isExecutingOrder = true;
                 isPaused = true;
-                if (!currentActiveGap.limits?.hasOverlap) {
-                    console.log('\n⚠️ [ADVERTENCIA]: Los límites no son directamente compatibles.');
-                    console.log(`Motivo: ${currentActiveGap.limits?.reason}`);
-                }
-                console.log(`\n\n⚡ [ACCION DISPARADA]: Iniciando compra semi-automática de ${tradeAmount} USDT...`);
-                try {
-                    await executeBybitTakerOrder({
-                        side: 'BUY',
-                        merchantNick: currentActiveGap.seller.nickName,
-                        price: currentActiveGap.buyPrice,
-                        amountUsdt: tradeAmount
-                    });
+                lastOrderTime = Date.now();     // marca inicio del cooldown
+                currentActiveGap = null;         // libera gap para no re-disparar
 
-                    // REGISTRAR EN CSV QUE SE COMPRÓ EN ESTA OPORTUNIDAD:
-                    logOpportunity(currentActiveGap, {
-                        executed: true,
-                        side: 'BUY',
-                        amountUsdt: tradeAmount
-                    });
+                if (!gap.limits?.hasOverlap) {
+                    console.log('\n⚠️ [ADVERTENCIA]: Los límites no son directamente compatibles.');
+                    console.log(`Motivo: ${gap.limits?.reason}`);
+                }
+                console.log(`\n\n⚡ [ACCION DISPARADA]: Iniciando ${actionLabel} semi-automática de ${tradeAmount} USDT...`);
+
+                try {
+                    await executeBybitTakerOrder({ side, merchantNick, price, amountUsdt: tradeAmount });
+
+                    logOpportunity(gap, { executed: true, side, amountUsdt: tradeAmount });
 
                     recordTradeInHistory({
-                        type: 'COMPRA',
+                        type: side === 'BUY' ? 'COMPRA' : 'VENTA',
                         cryptoAmount: tradeAmount,
-                        price: currentActiveGap.buyPrice,
-                        fiatAmount: tradeAmount * currentActiveGap.buyPrice,
-                        counterparty: currentActiveGap.seller.nickName
+                        price,
+                        fiatAmount: tradeAmount * price,
+                        counterparty: merchantNick
                     });
 
-                    console.log(`\n✅ [REGISTRADO EN CSV]: Oportunidad registrada con Compre_En_Oportunidad = "SI" (${tradeAmount} USDT a ${currentActiveGap.buyPrice.toFixed(3)} BOB vs Pico ${currentActiveGap.sellPrice.toFixed(3)} BOB).`);
+                    console.log(`\n✅ [REGISTRADO EN CSV]: ${actionLabel} registrada (${tradeAmount} USDT a ${price.toFixed(3)} BOB).`);
                 } catch (e) {
-                    console.error('Error al ejecutar pedido:', e.message);
+                    console.error(`Error al ejecutar pedido ${side}:`, e.message);
+                } finally {
+                    isExecutingOrder = false;
+                    isPaused = false;
+                    lastOrderTime = Date.now();  // reinicia el cooldown DESDE EL FIN de la orden
+                    console.log(`\n▶️ Radar reanudado. Cooldown ${ORDER_COOLDOWN_MS / 1000}s activo para prevenir órdenes dobles.`);
                 }
-                isExecutingOrder = false;
-                isPaused = false;
-                console.log('\n▶️ Reanudando Radar en 3 segundos...');
-                await new Promise(r => setTimeout(r, 3000));
-                return;
-            }
+            };
 
-            // Tecla [m]: Marcar que se compró manualmente en Bybit
-            if (key.name === 'm') {
-                logOpportunity(currentActiveGap, {
-                    executed: true,
+            if (key.name === 'c' || key.name === 'return') {
+                await runTradeAction({
                     side: 'BUY',
-                    amountUsdt: tradeAmount
+                    merchantNick: gap.seller.nickName,
+                    price: gap.buyPrice,
+                    actionLabel: 'compra'
                 });
-                recordTradeInHistory({
-                    type: 'COMPRA',
-                    cryptoAmount: tradeAmount,
-                    price: currentActiveGap.buyPrice,
-                    fiatAmount: tradeAmount * currentActiveGap.buyPrice,
-                    counterparty: currentActiveGap.seller.nickName
-                });
-                console.log(`\n✅ [MARCADO MANUAL EN CSV]: Compra registrada con Compre_En_Oportunidad = "SI" (${tradeAmount} USDT a ${currentActiveGap.buyPrice.toFixed(3)} BOB vs Pico ${currentActiveGap.sellPrice.toFixed(3)} BOB).`);
-                return;
-            }
-
-            if (key.name === 'i') {
-                const sellerNick = currentActiveGap.seller.nickName;
-                addIgnoredMerchant(sellerNick);
-                console.log(`\n🚫 [IGNORADO]: Comerciante "${sellerNick}" añadido a la lista de ignorados.`);
-                console.log('🔇 La alarma para este comerciante ha sido silenciada permanentemente.');
-                currentActiveGap = null;
                 return;
             }
 
             if (key.name === 'v') {
-                isExecutingOrder = true;
-                isPaused = true;
-                if (!currentActiveGap.limits?.hasOverlap) {
-                    console.log('\n⚠️ [ADVERTENCIA]: Los límites no son directamente compatibles.');
-                    console.log(`Motivo: ${currentActiveGap.limits?.reason}`);
-                }
-                console.log(`\n\n⚡ [ACCION DISPARADA]: Iniciando venta semi-automática de ${tradeAmount} USDT...`);
-                try {
-                    await executeBybitTakerOrder({
-                        side: 'SELL',
-                        merchantNick: currentActiveGap.buyer.nickName,
-                        price: currentActiveGap.sellPrice,
-                        amountUsdt: tradeAmount
-                    });
+                await runTradeAction({
+                    side: 'SELL',
+                    merchantNick: gap.buyer.nickName,
+                    price: gap.sellPrice,
+                    actionLabel: 'venta'
+                });
+                return;
+            }
 
-                    logOpportunity(currentActiveGap, {
-                        executed: true,
-                        side: 'SELL',
-                        amountUsdt: tradeAmount
-                    });
+            // Tecla [m]: Marcar que se compró manualmente en Bybit (sin ejecutar Playwright)
+            if (key.name === 'm') {
+                lastOrderTime = Date.now();
+                currentActiveGap = null;
+                logOpportunity(gap, { executed: true, side: 'BUY', amountUsdt: tradeAmount });
+                recordTradeInHistory({
+                    type: 'COMPRA',
+                    cryptoAmount: tradeAmount,
+                    price: gap.buyPrice,
+                    fiatAmount: tradeAmount * gap.buyPrice,
+                    counterparty: gap.seller.nickName
+                });
+                console.log(`\n✅ [MARCADO MANUAL EN CSV]: Compra registrada (${tradeAmount} USDT a ${gap.buyPrice.toFixed(3)} BOB vs Pico ${gap.sellPrice.toFixed(3)} BOB).`);
+                return;
+            }
 
-                    recordTradeInHistory({
-                        type: 'VENTA',
-                        cryptoAmount: tradeAmount,
-                        price: currentActiveGap.sellPrice,
-                        fiatAmount: tradeAmount * currentActiveGap.sellPrice,
-                        counterparty: currentActiveGap.buyer.nickName
-                    });
-
-                    console.log(`\n✅ [REGISTRADO EN CSV]: Venta registrada con éxito (${tradeAmount} USDT a ${currentActiveGap.sellPrice.toFixed(3)} BOB).`);
-                } catch (e) {
-                    console.error('Error al ejecutar pedido:', e.message);
-                }
-                isExecutingOrder = false;
-                isPaused = false;
-                console.log('\n▶️ Reanudando Radar en 3 segundos...');
-                await new Promise(r => setTimeout(r, 3000));
+            if (key.name === 'i') {
+                const sellerNick = gap.seller.nickName;
+                addIgnoredMerchant(sellerNick);
+                console.log(`\n🚫 [IGNORADO]: Comerciante "${sellerNick}" añadido a la lista de ignorados.`);
+                console.log('🔇 La alarma para este comerciante ha sido silenciada permanentemente.');
+                currentActiveGap = null;
                 return;
             }
         }
@@ -786,6 +720,7 @@ async function startGapHunterLoop() {
                     console.log('----------------------------------------------------------------------------------------');
                 } else {
                     currentActiveGap = null;
+                    radarLogger.markNoGap();  // emite CLOSE si había un gap activo trackeado
                     if (lastAlertTime) {
                         console.log(` ℹ️  Última brecha cazada a las: ${lastAlertTime}`);
                         console.log('----------------------------------------------------------------------------------------');

@@ -1,0 +1,462 @@
+diff --git a/ejercicio.js b/ejercicio.js
+index ba48524..29caf4b 100644
+--- a/ejercicio.js
++++ b/ejercicio.js
+@@ -159,94 +159,262 @@ function appendClosingToCSV(record) {
+ }
+ 
+ /**
+- * Consulta los saldos en vivo de las 3 plataformas y calcula el tipo de cambio promedio
++ * Consulta saldos vivos + tasa P2P promedio.
++ *
++ * Si algo falla, NO usa fallbacks silenciosos: devuelve `errors[]` para que
++ * el caller decida (abortar la apertura/cierre, o continuar con --force-partial).
++ *
++ * Overrides manuales (saltan la llamada a la fuente correspondiente):
++ *   options.customSol   -> saldo Banco Sol en BOB
++ *   options.customBybit -> saldo Bybit en USDT
++ *   options.customBinance -> saldo Binance en USDT
++ *   options.customRate  -> tasa manual BOB/USDT
+  */
+ async function fetchLiveFinancialSnapshot(options = {}) {
+     const ignored = loadIgnoredMerchants();
++    const errors = [];
+ 
+-    // 1. Obtener libros de órdenes para tasa promedio
+-    const [bybitSellers, bybitBuyers, binanceSellers, binanceBuyers] = await Promise.all([
+-        fetchBybitP2P({ side: '1', size: 5 }).catch(() => []),
+-        fetchBybitP2P({ side: '0', size: 5 }).catch(() => []),
+-        fetchBinanceP2P({ tradeType: 'BUY', rows: 5 }).catch(() => []),
+-        fetchBinanceP2P({ tradeType: 'SELL', rows: 5 }).catch(() => [])
+-    ]);
+-
+-    // Filtrar ignorados
+-    const cleanBybitSellers = bybitSellers.filter(s => !ignored.includes((s.nickName || '').toUpperCase()));
+-    const cleanBybitBuyers = bybitBuyers.filter(b => !ignored.includes((b.nickName || '').toUpperCase()));
+-    const cleanBinanceSellers = (binanceSellers || []).filter(item => {
+-        const nick = (item.advertiser?.nickName || '').toUpperCase();
+-        return !ignored.includes(nick);
+-    });
+-    const cleanBinanceBuyers = (binanceBuyers || []).filter(item => {
+-        const nick = (item.advertiser?.nickName || '').toUpperCase();
+-        return !ignored.includes(nick);
+-    });
++    // ---------- 1. TASA PROMEDIO ----------
++    let bybitBuy = 0, bybitSell = 0, binanceBuy = 0, binanceSell = 0;
++    let rateAvg = null;
++    let rateTrusted = false;
+ 
+-    const bybitBuy = parseFloat(cleanBybitSellers[0]?.price || 0);
+-    const bybitSell = parseFloat(cleanBybitBuyers[0]?.price || 0);
+-    const binanceBuy = parseFloat(cleanBinanceSellers[0]?.adv?.price || 0);
+-    const binanceSell = parseFloat(cleanBinanceBuyers[0]?.adv?.price || 0);
++    if (typeof options.customRate === 'number' && options.customRate > 0) {
++        rateAvg = parseFloat(options.customRate.toFixed(3));
++        rateTrusted = true;
++    } else {
++        const [bybitSellersRes, bybitBuyersRes, binanceSellersRes, binanceBuyersRes] = await Promise.allSettled([
++            fetchBybitP2P({ side: '1', size: 5 }),
++            fetchBybitP2P({ side: '0', size: 5 }),
++            fetchBinanceP2P({ tradeType: 'BUY', rows: 5 }),
++            fetchBinanceP2P({ tradeType: 'SELL', rows: 5 })
++        ]);
++
++        const bybitSellers = bybitSellersRes.status === 'fulfilled' ? (bybitSellersRes.value || []) : [];
++        const bybitBuyers = bybitBuyersRes.status === 'fulfilled' ? (bybitBuyersRes.value || []) : [];
++        const binanceSellers = binanceSellersRes.status === 'fulfilled' ? (binanceSellersRes.value || []) : [];
++        const binanceBuyers = binanceBuyersRes.status === 'fulfilled' ? (binanceBuyersRes.value || []) : [];
++
++        if (bybitSellersRes.status === 'rejected') errors.push({ src: 'bybit_p2p_sellers', msg: bybitSellersRes.reason?.message || 'fetch failed' });
++        if (bybitBuyersRes.status === 'rejected') errors.push({ src: 'bybit_p2p_buyers', msg: bybitBuyersRes.reason?.message || 'fetch failed' });
++        if (binanceSellersRes.status === 'rejected') errors.push({ src: 'binance_p2p_sellers', msg: binanceSellersRes.reason?.message || 'fetch failed' });
++        if (binanceBuyersRes.status === 'rejected') errors.push({ src: 'binance_p2p_buyers', msg: binanceBuyersRes.reason?.message || 'fetch failed' });
++
++        const cleanBybitSellers = bybitSellers.filter(s => !ignored.includes((s.nickName || '').toUpperCase()));
++        const cleanBybitBuyers = bybitBuyers.filter(b => !ignored.includes((b.nickName || '').toUpperCase()));
++        const cleanBinanceSellers = binanceSellers.filter(item => !ignored.includes((item.advertiser?.nickName || '').toUpperCase()));
++        const cleanBinanceBuyers = binanceBuyers.filter(item => !ignored.includes((item.advertiser?.nickName || '').toUpperCase()));
++
++        bybitBuy = parseFloat(cleanBybitSellers[0]?.price || 0);
++        bybitSell = parseFloat(cleanBybitBuyers[0]?.price || 0);
++        binanceBuy = parseFloat(cleanBinanceSellers[0]?.adv?.price || 0);
++        binanceSell = parseFloat(cleanBinanceBuyers[0]?.adv?.price || 0);
++
++        const validRates = [bybitBuy, bybitSell, binanceBuy, binanceSell].filter(r => r > 0);
++
++        // Antes: hardcode 12.05. Ahora: solo confiamos si tenemos >= 2 fuentes.
++        if (validRates.length >= 2) {
++            rateAvg = parseFloat((validRates.reduce((a, b) => a + b, 0) / validRates.length).toFixed(3));
++            rateTrusted = true;
++        } else if (validRates.length === 1) {
++            rateAvg = parseFloat(validRates[0].toFixed(3));
++            rateTrusted = false;
++            errors.push({ src: 'rate_avg', msg: `Solo 1 fuente de tasa disponible (${rateAvg} BOB/USDT); se marcó como no confiable.` });
++        } else {
++            errors.push({ src: 'rate_avg', msg: 'Ninguna fuente de tasa P2P respondió. Usa --rate=X.XX para forzar manualmente.' });
++        }
++    }
+ 
+-    const validRates = [bybitBuy, bybitSell, binanceBuy, binanceSell].filter(r => r > 0);
+-    const rateAvg = validRates.length > 0
+-        ? parseFloat((validRates.reduce((a, b) => a + b, 0) / validRates.length).toFixed(3))
+-        : 12.05;
++    // ---------- 2. BANCO SOL ----------
++    let bancoSolBob = null;
++    let bancoSolTrusted = false;
++    let bancoSolSource = null;
+ 
+-    // 2. Obtener saldos de las plataformas
+-    let bancoSolBob = 1998.31;
+-    if (fs.existsSync(CAPITAL_FILE)) {
++    if (typeof options.customSol === 'number' && options.customSol >= 0) {
++        bancoSolBob = options.customSol;
++        bancoSolTrusted = true;
++        bancoSolSource = 'manual';
++    } else if (options.forceLiveBank) {
+         try {
+-            const cap = JSON.parse(fs.readFileSync(CAPITAL_FILE, 'utf8'));
+-            if (typeof cap.bancoSolBob === 'number') bancoSolBob = cap.bancoSolBob;
+-        } catch (e) {}
++            const live = await getBancoSolLiveBalance(true);
++            if (typeof live === 'number' && live >= 0) {
++                bancoSolBob = live;
++                bancoSolTrusted = true;
++                bancoSolSource = 'live';
++            } else {
++                errors.push({ src: 'bancosol', msg: 'La consulta a Banco Sol devolvió un valor no numérico.' });
++            }
++        } catch (e) {
++            errors.push({ src: 'bancosol', msg: `No se pudo leer saldo en vivo de Banco Sol: ${e.message}` });
++        }
+     }
+-    if (options.customSol !== undefined) {
+-        bancoSolBob = options.customSol;
++
++    // Fallback a capital.json SOLO si no se forzó live y no hay custom
++    if (bancoSolBob === null && !options.forceLiveBank) {
++        if (fs.existsSync(CAPITAL_FILE)) {
++            try {
++                const cap = JSON.parse(fs.readFileSync(CAPITAL_FILE, 'utf8'));
++                if (typeof cap.bancoSolBob === 'number') {
++                    bancoSolBob = cap.bancoSolBob;
++                    bancoSolTrusted = true;
++                    bancoSolSource = `capital.json (${cap.updatedAt || 'sin fecha'})`;
++                }
++            } catch (e) {
++                errors.push({ src: 'bancosol', msg: `capital.json corrupto: ${e.message}` });
++            }
++        }
++    }
++
++    if (bancoSolBob === null) {
++        errors.push({ src: 'bancosol', msg: 'Saldo Banco Sol desconocido. Usa --sol=MONTO_BOB para forzar manualmente.' });
+     }
+ 
+-    const [bankBal, bybitApiBal, binanceApiBal] = await Promise.all([
+-        options.forceLiveBank ? getBancoSolLiveBalance(true).catch(() => bancoSolBob) : Promise.resolve(bancoSolBob),
+-        getLiveBybitBalancesFromApi().catch(() => null),
+-        getLiveBinanceBalancesFromApi().catch(() => null)
+-    ]);
++    // ---------- 3. BYBIT ----------
++    let bybitUsdt = null;
++    let bybitTrusted = false;
+ 
+-    if (typeof bankBal === 'number' && bankBal >= 0) {
+-        bancoSolBob = bankBal;
++    if (typeof options.customBybit === 'number' && options.customBybit >= 0) {
++        bybitUsdt = options.customBybit;
++        bybitTrusted = true;
++    } else {
++        try {
++            const bal = await getLiveBybitBalancesFromApi();
++            if (bal && (typeof bal.totalUsdt === 'number' || typeof bal.usdtFunding === 'number')) {
++                bybitUsdt = bal.totalUsdt || bal.usdtFunding || 0;
++                bybitTrusted = true;
++            } else {
++                errors.push({ src: 'bybit_balance', msg: 'API de Bybit no devolvió saldo USDT. Usa --bybit=MONTO_USDT para forzar.' });
++            }
++        } catch (e) {
++            errors.push({ src: 'bybit_balance', msg: `Error al leer saldo Bybit: ${e.message}` });
++        }
+     }
+ 
+-    const bybitUsdt = bybitApiBal ? (bybitApiBal.totalUsdt || bybitApiBal.usdtFunding || 0) : 0;
+-    const binanceUsdt = binanceApiBal ? (binanceApiBal.totalUsdt || binanceApiBal.usdtFunding || 0) : 0;
++    // ---------- 4. BINANCE ----------
++    let binanceUsdt = null;
++    let binanceTrusted = false;
++
++    if (typeof options.customBinance === 'number' && options.customBinance >= 0) {
++        binanceUsdt = options.customBinance;
++        binanceTrusted = true;
++    } else {
++        try {
++            const bal = await getLiveBinanceBalancesFromApi();
++            if (bal && (typeof bal.totalUsdt === 'number' || typeof bal.usdtFunding === 'number')) {
++                binanceUsdt = bal.totalUsdt || bal.usdtFunding || 0;
++                binanceTrusted = true;
++            } else {
++                errors.push({ src: 'binance_balance', msg: 'API de Binance no devolvió saldo USDT. Usa --binance=MONTO_USDT para forzar.' });
++            }
++        } catch (e) {
++            errors.push({ src: 'binance_balance', msg: `Error al leer saldo Binance: ${e.message}` });
++        }
++    }
+ 
+-    const bybitBob = parseFloat((bybitUsdt * rateAvg).toFixed(2));
+-    const binanceBob = parseFloat((binanceUsdt * rateAvg).toFixed(2));
+-    const totalCapitalBob = parseFloat((bancoSolBob + bybitBob + binanceBob).toFixed(2));
+-    const totalCapitalUsdt = rateAvg > 0 ? parseFloat((totalCapitalBob / rateAvg).toFixed(2)) : 0;
++    // ---------- 5. CÁLCULOS ----------
++    // Si falta algo crítico, devolvemos los parciales pero marcados como no confiables.
++    const safeRate = rateAvg || 0;
++    const safeSol = bancoSolBob || 0;
++    const safeBybit = bybitUsdt || 0;
++    const safeBinance = binanceUsdt || 0;
++
++    const bybitBob = parseFloat((safeBybit * safeRate).toFixed(2));
++    const binanceBob = parseFloat((safeBinance * safeRate).toFixed(2));
++    const totalCapitalBob = parseFloat((safeSol + bybitBob + binanceBob).toFixed(2));
++    const totalCapitalUsdt = safeRate > 0 ? parseFloat((totalCapitalBob / safeRate).toFixed(2)) : 0;
++
++    const fullyTrusted = rateTrusted && bancoSolTrusted && bybitTrusted && binanceTrusted;
+ 
+     return {
+         timestamp: new Date().toISOString(),
+         timeStr: getTimeStr(),
+         dateStr: getTodayStr(),
+         rates: {
+-            rateAvg,
+-            bybitBuy,
+-            bybitSell,
+-            binanceBuy,
+-            binanceSell
++            rateAvg: safeRate,
++            bybitBuy, bybitSell, binanceBuy, binanceSell,
++            trusted: rateTrusted
+         },
+         balances: {
+-            bybitUsdt,
++            bybitUsdt: safeBybit,
+             bybitBob,
+-            binanceUsdt,
++            binanceUsdt: safeBinance,
+             binanceBob,
+-            bancoSolBob,
++            bancoSolBob: safeSol,
+             totalCapitalBob,
+-            totalCapitalUsdt
+-        }
++            totalCapitalUsdt,
++            bybitTrusted,
++            binanceTrusted,
++            bancoSolTrusted,
++            bancoSolSource
++        },
++        errors,
++        fullyTrusted
+     };
+ }
+ 
++/**
++ * Parsea overrides manuales (--sol=X --bybit=Y --binance=Z --rate=R) desde argv.
++ */
++function parseSnapshotOverrides(args) {
++    const out = {};
++    for (const a of args) {
++        if (a.startsWith('--sol=')) {
++            const v = parseFloat(a.split('=')[1]);
++            if (!isNaN(v) && v >= 0) out.customSol = v;
++        } else if (a.startsWith('--bybit=')) {
++            const v = parseFloat(a.split('=')[1]);
++            if (!isNaN(v) && v >= 0) out.customBybit = v;
++        } else if (a.startsWith('--binance=')) {
++            const v = parseFloat(a.split('=')[1]);
++            if (!isNaN(v) && v >= 0) out.customBinance = v;
++        } else if (a.startsWith('--rate=')) {
++            const v = parseFloat(a.split('=')[1]);
++            if (!isNaN(v) && v > 0) out.customRate = v;
++        }
++    }
++    return out;
++}
++
++/**
++ * Imprime los errores del snapshot en consola y devuelve true si el snapshot es seguro para persistir.
++ * Si no es seguro y no se pasó --force-partial, devuelve false y el caller debe abortar.
++ */
++function validateSnapshot(snap, args, operacion) {
++    if (snap.fullyTrusted && snap.errors.length === 0) return true;
++
++    console.log('\n================================================================================');
++    console.log(` ⚠️  SNAPSHOT INCOMPLETO AL INTENTAR ${operacion.toUpperCase()}`);
++    console.log('================================================================================');
++    for (const err of snap.errors) {
++        console.log(` ❌ [${err.src}] ${err.msg}`);
++    }
++    console.log('--------------------------------------------------------------------------------');
++    console.log(' Estado de confianza por fuente:');
++    console.log(`   • Tasa promedio:   ${snap.rates.trusted ? '✅' : '❌'}  (${snap.rates.rateAvg} BOB/USDT)`);
++    console.log(`   • Banco Sol:       ${snap.balances.bancoSolTrusted ? '✅' : '❌'}  (${formatNum(snap.balances.bancoSolBob)} BOB${snap.balances.bancoSolSource ? ` — fuente: ${snap.balances.bancoSolSource}` : ''})`);
++    console.log(`   • Bybit USDT:      ${snap.balances.bybitTrusted ? '✅' : '❌'}  (${formatNum(snap.balances.bybitUsdt)} USDT)`);
++    console.log(`   • Binance USDT:    ${snap.balances.binanceTrusted ? '✅' : '❌'}  (${formatNum(snap.balances.binanceUsdt)} USDT)`);
++    console.log('--------------------------------------------------------------------------------');
++
++    if (args.includes('--force-partial')) {
++        console.log(' ⚠️  --force-partial detectado: se persistirá con los datos parciales mostrados.');
++        console.log('    El ROI calculado al cerrar puede estar sesgado si alguno de los campos es incorrecto.');
++        console.log('================================================================================\n');
++        return true;
++    }
++
++    console.log(' 🛑 OPERACIÓN ABORTADA. Opciones para continuar:');
++    console.log('    1. Reintenta en unos segundos:    node ejercicio.js --' + operacion);
++    console.log('    2. Fuerza valores faltantes con flags manuales:');
++    console.log('         --sol=1500      (Banco Sol en BOB)');
++    console.log('         --bybit=120     (Saldo Bybit en USDT)');
++    console.log('         --binance=240   (Saldo Binance en USDT)');
++    console.log('         --rate=12.05    (Tasa manual BOB/USDT)');
++    console.log('    3. Acepta registrar con lo que hay:    agrega --force-partial');
++    console.log('================================================================================\n');
++    return false;
++}
++
+ /**
+  * Parser inteligente de montos y monedas (BOB / USDT / $)
+  */
+@@ -385,9 +553,19 @@ async function handleOpenDay(args) {
+ 
+     console.clear();
+     console.log('⏳ Sincronizando saldos en vivo de Bybit, Binance y Banco Sol para la APERTURA...');
+-    const customSol = parseSolArg(args);
+-    const shouldQueryLive = !args.includes('--no-live') && customSol === undefined;
+-    const snap = await fetchLiveFinancialSnapshot({ customSol, forceLiveBank: shouldQueryLive });
++    const overrides = parseSnapshotOverrides(args);
++    // parseSolArg mantiene compat con --sol / --bank / -s (y además persiste en capital.json)
++    const legacySol = parseSolArg(args);
++    if (overrides.customSol === undefined && legacySol !== undefined) {
++        overrides.customSol = legacySol;
++    }
++    const shouldQueryLive = !args.includes('--no-live') && overrides.customSol === undefined;
++    const snap = await fetchLiveFinancialSnapshot({ ...overrides, forceLiveBank: shouldQueryLive });
++
++    if (!validateSnapshot(snap, args, 'abrir')) {
++        return;
++    }
++
+     const b = snap.balances;
+     const r = snap.rates;
+ 
+@@ -398,6 +576,12 @@ async function handleOpenDay(args) {
+         ledger[today].incomes = [];
+     }
+ 
++    // Si estamos sobrescribiendo una apertura previa con --force, guardamos backup
++    if (ledger[today].opening && force) {
++        if (!Array.isArray(ledger[today].openingHistory)) ledger[today].openingHistory = [];
++        ledger[today].openingHistory.push({ ...ledger[today].opening, overwrittenAt: new Date().toISOString() });
++    }
++
+     ledger[today].opening = {
+         timestamp: snap.timestamp,
+         time: snap.timeStr,
+@@ -408,7 +592,15 @@ async function handleOpenDay(args) {
+         binanceBob: b.binanceBob,
+         bancoSolBob: b.bancoSolBob,
+         totalInitialBob: b.totalCapitalBob,
+-        totalInitialUsdt: b.totalCapitalUsdt
++        totalInitialUsdt: b.totalCapitalUsdt,
++        trustFlags: {
++            rate: r.trusted,
++            bancoSol: b.bancoSolTrusted,
++            bybit: b.bybitTrusted,
++            binance: b.binanceTrusted,
++            fullyTrusted: snap.fullyTrusted
++        },
++        errorsAtCapture: snap.errors || []
+     };
+ 
+     saveLedger(ledger);
+@@ -652,24 +844,44 @@ async function handleCloseDay(args) {
+         const initialArg = args.find(a => a.startsWith('--inicio=') || a.startsWith('--open='));
+         if (!initialArg) return;
+         const manualInit = parseFloat(initialArg.split('=')[1]);
+-        if (!isNaN(manualInit) && manualInit > 0) {
+-            if (!ledger[today]) ledger[today] = { date: today, expenses: [], incomes: [] };
+-            ledger[today].opening = {
+-                timestamp: new Date().toISOString(),
+-                time: getTimeStr(),
+-                rateAvg: 12.05,
+-                bybitUsdt: 0,
+-                bybitBob: 0,
+-                binanceUsdt: 0,
+-                binanceBob: 0,
+-                bancoSolBob: manualInit,
+-                totalInitialBob: manualInit,
+-                totalInitialUsdt: manualInit / 12.05
+-            };
+-            console.log(`✅ Registrada apertura manual provisional con ${manualInit} BOB.`);
+-        } else {
++        if (isNaN(manualInit) || manualInit <= 0) {
+             return;
+         }
++
++        // Antes: hardcode rateAvg=12.05 → ganancia USDT mentirosa.
++        // Ahora: pedimos tasa manual (--rate=X) o la tomamos del snapshot en vivo.
++        const rateArg = args.find(a => a.startsWith('--rate='));
++        let manualRate = rateArg ? parseFloat(rateArg.split('=')[1]) : null;
++
++        if (!manualRate || isNaN(manualRate) || manualRate <= 0) {
++            console.log('⏳ Obteniendo tasa P2P actual para registrar apertura provisional...');
++            const probe = await fetchLiveFinancialSnapshot({});
++            if (probe.rates.trusted) {
++                manualRate = probe.rates.rateAvg;
++                console.log(`✅ Tasa obtenida en vivo: ${manualRate} BOB/USDT`);
++            } else {
++                console.log('\n🛑 No se pudo obtener tasa P2P en vivo y no se pasó --rate=X.');
++                console.log('   Reintenta con: node ejercicio.js --cerrar --inicio=' + manualInit + ' --rate=12.05\n');
++                return;
++            }
++        }
++
++        if (!ledger[today]) ledger[today] = { date: today, expenses: [], incomes: [] };
++        ledger[today].opening = {
++            timestamp: new Date().toISOString(),
++            time: getTimeStr(),
++            rateAvg: manualRate,
++            bybitUsdt: 0,
++            bybitBob: 0,
++            binanceUsdt: 0,
++            binanceBob: 0,
++            bancoSolBob: manualInit,
++            totalInitialBob: manualInit,
++            totalInitialUsdt: parseFloat((manualInit / manualRate).toFixed(2)),
++            trustFlags: { rate: true, bancoSol: true, bybit: false, binance: false, fullyTrusted: false },
++            errorsAtCapture: [{ src: 'manual_opening', msg: `Apertura reconstruida manualmente desde --inicio con rate ${manualRate}` }]
++        };
++        console.log(`✅ Registrada apertura manual provisional con ${manualInit} BOB @ ${manualRate} BOB/USDT.`);
+     }
+ 
+     const op = ledger[today].opening;
+@@ -680,9 +892,18 @@ async function handleCloseDay(args) {
+ 
+     console.clear();
+     console.log('⏳ Sincronizando saldos finales de Bybit, Binance y Banco Sol para el CIERRE...');
+-    const customSol = parseSolArg(args);
+-    const shouldQueryLive = !args.includes('--no-live') && customSol === undefined;
+-    const snap = await fetchLiveFinancialSnapshot({ customSol, forceLiveBank: shouldQueryLive });
++    const overrides = parseSnapshotOverrides(args);
++    const legacySol = parseSolArg(args);
++    if (overrides.customSol === undefined && legacySol !== undefined) {
++        overrides.customSol = legacySol;
++    }
++    const shouldQueryLive = !args.includes('--no-live') && overrides.customSol === undefined;
++    const snap = await fetchLiveFinancialSnapshot({ ...overrides, forceLiveBank: shouldQueryLive });
++
++    if (!validateSnapshot(snap, args, 'cerrar')) {
++        return;
++    }
++
+     const b = snap.balances;
+     const r = snap.rates;
+ 

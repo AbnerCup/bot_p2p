@@ -9,3 +9,13 @@ qr_dia/
 *.csv
 diario_ledger.*
 capital.json
+
+# Caches generados en runtime (fix B7)
+bybit_cache.json
+binance_cache.json
+
+# Histórico JSONL del logger de radars (fix B5/B6)
+*_market_history_*.jsonl
+*_market_history.json
+cross_arbitrage_history.json
+history.json
