@@ -1,0 +1,11 @@
+.env
+session_*.json
+*_edge_profile/
+node_modules/
+orders_data/
+qr_dia/
+*.png
+*.jpeg
+*.csv
+diario_ledger.*
+capital.json

@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>P2P Bot • Centro de Autorización</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0A0D14;
+            --surface: #121824;
+            --surface-glass: rgba(18, 24, 36, 0.75);
+            --surface-card: #182030;
+            --border: rgba(255, 255, 255, 0.08);
+            --border-glow: rgba(124, 58, 237, 0.3);
+            --primary: #7C3AED;
+            --primary-light: #A78BFA;
+            --emerald: #10B981;
+            --emerald-glow: rgba(16, 185, 129, 0.25);
+            --cyan: #06B6D4;
+            --amber: #F59E0B;
+            --rose: #F43F5E;
+            --text-main: #F8FAFC;
+            --text-muted: #94A3B8;
+            --radius-lg: 24px;
+            --radius-md: 16px;
+            --radius-sm: 10px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            background: var(--bg);
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(124, 58, 237, 0.15) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(16, 185, 129, 0.12) 0%, transparent 45%);
+            color: var(--text-main);
+            font-family: 'Outfit', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+            padding-bottom: 40px;
+        }
+
+        /* Top Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 18px 22px;
+            background: var(--surface-glass);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .brand-badge {
+            width: 38px;
+            height: 38px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #F59E0B, #D97706);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 19px;
+            color: #000;
+            box-shadow: 0 4px 14px rgba(245, 158, 11, 0.3);
+        }
+
+        .brand-title {
+            font-size: 17px;
+            font-weight: 700;
+            letter-spacing: -0.3px;
+        }
+
+        .brand-sub {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+        }
+
+        .connection-pill {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            background: rgba(16, 185, 129, 0.12);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--emerald);
+        }
+
+        .pulsing-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--emerald);
+            box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+            animation: pulse-green 2s infinite;
+        }
+
+        @keyframes pulse-green {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 7px rgba(16, 185, 129, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+
+        main {
+            flex: 1;
+            padding: 20px;
+            max-width: 520px;
+            margin: 0 auto;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        /* Banner en Espera (Idle Mode) */
+        .idle-card {
+            background: var(--surface-glass);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 28px 24px;
+            text-align: center;
+            backdrop-filter: blur(12px);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .radar-box {
+            position: relative;
+            width: 76px;
+            height: 76px;
+            margin: 0 auto;
+        }
+
+        .radar-circle {
+            position: absolute;
+            inset: 0;
+            border-radius: 50%;
+            border: 2px solid rgba(124, 58, 237, 0.4);
+            animation: radar-grow 2.4s infinite ease-out;
+        }
+
+        .radar-circle:nth-child(2) {
+            animation-delay: 0.8s;
+        }
+
+        .radar-center {
+            position: absolute;
+            inset: 18px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--primary), #9333EA);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 0 20px rgba(124, 58, 237, 0.5);
+        }
+
+        @keyframes radar-grow {
+            0% { transform: scale(0.5); opacity: 1; }
+            100% { transform: scale(1.5); opacity: 0; }
+        }
+
+        .idle-title {
+            font-size: 20px;
+            font-weight: 700;
+        }
+
+        .idle-desc {
+            font-size: 14px;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
+
+        /* Stat Grid */
+        .stat-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            width: 100%;
+        }
+
+        .stat-card {
+            background: var(--surface-glass);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 600;
+        }
+
+        .stat-value {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        .stat-sub {
+            font-size: 11px;
+            color: var(--emerald);
+            font-weight: 500;
+        }
+
+        /* Transfer Alert Card (Active Mode) */
+        .alert-card {
+            display: none;
+            background: linear-gradient(180deg, rgba(30, 20, 50, 0.85) 0%, rgba(18, 24, 36, 0.95) 100%);
+            border: 2px solid var(--primary-light);
+            border-radius: var(--radius-lg);
+            padding: 24px;
+            box-shadow: 0 10px 40px rgba(124, 58, 237, 0.35);
+            backdrop-filter: blur(20px);
+            animation: slide-up 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        @keyframes slide-up {
+            from { opacity: 0; transform: translateY(24px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .alert-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .alert-tag {
+            background: rgba(244, 63, 94, 0.2);
+            color: #FDA4AF;
+            border: 1px solid rgba(244, 63, 94, 0.4);
+            padding: 4px 10px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            animation: pulse-red 1.5s infinite;
+        }
+
+        @keyframes pulse-red {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .amount-hero {
+            text-align: center;
+            margin: 16px 0 24px;
+        }
+
+        .amount-currency {
+            font-size: 16px;
+            color: var(--emerald);
+            font-weight: 700;
+        }
+
+        .amount-number {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 44px;
+            font-weight: 800;
+            color: #FFFFFF;
+            letter-spacing: -1px;
+        }
+
+        /* Order Details List */
+        .details-list {
+            background: var(--surface-card);
+            border-radius: var(--radius-md);
+            padding: 14px 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-bottom: 22px;
+            border: 1px solid var(--border);
+        }
+
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+        }
+
+        .detail-label {
+            color: var(--text-muted);
+        }
+
+        .detail-val {
+            font-weight: 600;
+            text-align: right;
+            max-width: 60%;
+            word-break: break-word;
+        }
+
+        .bank-badge {
+            background: rgba(124, 58, 237, 0.2);
+            border: 1px solid rgba(167, 139, 250, 0.4);
+            color: #DDD6FE;
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 12px;
+        }
+
+        /* Token Input Pad */
+        .token-section {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+
+        .token-label-box {
+            text-align: center;
+        }
+
+        .token-label {
+            font-size: 15px;
+            font-weight: 700;
+            color: #FFFFFF;
+        }
+
+        .token-sub {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        .token-display {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin: 8px 0;
+        }
+
+        .token-cell {
+            width: 44px;
+            height: 52px;
+            background: #0D131F;
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 26px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #FFFFFF;
+            transition: all 0.2s;
+        }
+
+        .token-cell.active {
+            border-color: var(--primary-light);
+            box-shadow: 0 0 14px rgba(124, 58, 237, 0.4);
+        }
+
+        .token-cell.filled {
+            border-color: var(--emerald);
+            background: rgba(16, 185, 129, 0.08);
+            color: var(--emerald);
+        }
+
+        /* Numeric Numpad */
+        .numpad {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-top: 8px;
+        }
+
+        .numpad-btn {
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            height: 56px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 22px;
+            font-weight: 700;
+            color: #FFFFFF;
+            cursor: pointer;
+            transition: all 0.15s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .numpad-btn:active {
+            transform: scale(0.94);
+            background: rgba(124, 58, 237, 0.3);
+            border-color: var(--primary-light);
+        }
+
+        .numpad-btn.action {
+            font-size: 15px;
+            color: var(--text-muted);
+        }
+
+        /* Authorize Button */
+        .btn-authorize {
+            width: 100%;
+            height: 58px;
+            background: linear-gradient(135deg, #10B981, #059669);
+            border: none;
+            border-radius: 16px;
+            color: #FFFFFF;
+            font-family: 'Outfit', sans-serif;
+            font-size: 17px;
+            font-weight: 700;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            box-shadow: 0 6px 20px var(--emerald-glow);
+            transition: all 0.2s;
+            margin-top: 10px;
+        }
+
+        .btn-authorize:active {
+            transform: scale(0.98);
+        }
+
+        .btn-authorize:disabled {
+            background: #2D3748;
+            color: #718096;
+            box-shadow: none;
+            cursor: not-allowed;
+        }
+
+        /* Success Card Modal */
+        .success-card {
+            display: none;
+            background: var(--surface-glass);
+            border: 2px solid var(--emerald);
+            border-radius: var(--radius-lg);
+            padding: 28px 24px;
+            text-align: center;
+            backdrop-filter: blur(16px);
+            animation: slide-up 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .success-icon {
+            width: 64px;
+            height: 64px;
+            border-radius: 50%;
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--emerald);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 16px;
+            font-size: 32px;
+            box-shadow: 0 0 24px rgba(16, 185, 129, 0.3);
+        }
+
+        .receipt-preview {
+            width: 100%;
+            max-height: 240px;
+            object-fit: cover;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            margin: 16px 0;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header Sticky -->
+    <header>
+        <div class="brand">
+            <div class="brand-badge">⚡</div>
+            <div>
+                <div class="brand-title">Bot P2P • Móvil</div>
+                <div class="brand-sub">Banco Sol / Binance</div>
+            </div>
+        </div>
+        <div class="connection-pill" id="connStatus">
+            <div class="pulsing-dot"></div>
+            <span>En Línea</span>
+        </div>
+    </header>
+
+    <main>
+
+        <!-- MODO EN ESPERA (IDLE) -->
+        <div class="idle-card" id="idleCard">
+            <div class="radar-box">
+                <div class="radar-circle"></div>
+                <div class="radar-circle"></div>
+                <div class="radar-center">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#FFF" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                </div>
+            </div>
+            <div class="idle-title">Vigía de Órdenes Activo</div>
+            <div class="idle-desc">
+                El bot está monitoreando Binance P2P. Cuando ingrese una orden, sonará una alarma en tu teléfono para que ingreses el Token Móvil.
+            </div>
+            <button class="btn-authorize" style="background: rgba(124, 58, 237, 0.2); border: 1px solid var(--primary-light); height: 44px; font-size: 14px;" onclick="testAlarm()">
+                🔔 Probar Sonido de Alarma
+            </button>
+        </div>
+
+        <!-- MODO ALERTA DE TRANSFERENCIA (PENDIENTE) -->
+        <div class="alert-card" id="alertCard">
+            <div class="alert-header">
+                <div class="alert-tag">⚡ AUTORIZACIÓN REQUERIDA</div>
+                <div style="font-size: 12px; color: var(--text-muted);" id="orderIdText">ORD-0000</div>
+            </div>
+
+            <div class="amount-hero">
+                <div class="amount-currency">MONTO A PAGAR EN BANCO SOL</div>
+                <div class="amount-number" id="amountText">Bs 0.00</div>
+            </div>
+
+            <div class="details-list">
+                <div class="detail-row">
+                    <span class="detail-label">Beneficiario</span>
+                    <span class="detail-val" id="beneficiaryText">-</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Banco Destino</span>
+                    <span class="detail-val"><span class="bank-badge" id="bankText">-</span></span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">N° de Cuenta</span>
+                    <span class="detail-val" id="accountText" style="font-family: 'Space Grotesk'; font-size: 15px;">-</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Glosa / Motivo</span>
+                    <span class="detail-val" id="glosaText" style="color: var(--primary-light);">-</span>
+                </div>
+            </div>
+
+            <div class="token-section">
+                <div class="token-label-box">
+                    <div class="token-label">Ingresa el Token Móvil (App Sol)</div>
+                    <div class="token-sub">Código dinámico de 6 dígitos</div>
+                </div>
+
+                <div class="token-display">
+                    <div class="token-cell" id="c0"></div>
+                    <div class="token-cell" id="c1"></div>
+                    <div class="token-cell" id="c2"></div>
+                    <div class="token-cell" id="c3"></div>
+                    <div class="token-cell" id="c4"></div>
+                    <div class="token-cell" id="c5"></div>
+                </div>
+
+                <!-- Teclado Numérico Táctil -->
+                <div class="numpad">
+                    <button class="numpad-btn" onclick="pressKey('1')">1</button>
+                    <button class="numpad-btn" onclick="pressKey('2')">2</button>
+                    <button class="numpad-btn" onclick="pressKey('3')">3</button>
+                    <button class="numpad-btn" onclick="pressKey('4')">4</button>
+                    <button class="numpad-btn" onclick="pressKey('5')">5</button>
+                    <button class="numpad-btn" onclick="pressKey('6')">6</button>
+                    <button class="numpad-btn" onclick="pressKey('7')">7</button>
+                    <button class="numpad-btn" onclick="pressKey('8')">8</button>
+                    <button class="numpad-btn" onclick="pressKey('9')">9</button>
+                    <button class="numpad-btn action" onclick="clearToken()">C</button>
+                    <button class="numpad-btn" onclick="pressKey('0')">0</button>
+                    <button class="numpad-btn action" onclick="backspace()">⌫</button>
+                </div>
+
+                <button class="btn-authorize" id="btnSubmit" disabled onclick="submitToken()">
+                    <span>⚡ TRANSFERIR AHORA</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- MODO ÉXITO / COMPROBANTE -->
+        <div class="success-card" id="successCard">
+            <div class="success-icon">✓</div>
+            <div style="font-size: 20px; font-weight: 700; margin-bottom: 6px;">¡Transferencia Realizada!</div>
+            <div style="font-size: 13px; color: var(--text-muted);">Los fondos han sido transferidos exitosamente en Banco Sol.</div>
+            <img src="/api/receipt" id="receiptImg" class="receipt-preview" alt="Comprobante Bancario" onclick="window.open('/api/receipt')">
+            <button class="btn-authorize" style="background: var(--surface-card); border: 1px solid var(--border);" onclick="resetToIdle()">
+                Aceptar y Volver al Vigía
+            </button>
+        </div>
+
+        <!-- Estadísticas Rápidas -->
+        <div class="stat-grid">
+            <div class="stat-card">
+                <div class="stat-label">Billetera Funding</div>
+                <div class="stat-value" id="statBalance">-- USDT</div>
+                <div class="stat-sub" id="statBalanceBob">≈ -- BOB</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Ganancia Hoy</div>
+                <div class="stat-value" id="statProfit" style="color: var(--emerald);">+0.00 BOB</div>
+                <div class="stat-sub">Margen Maker</div>
+            </div>
+        </div>
+
+    </main>
+
+    <script>
+        let currentPin = '';
+        let audioCtx = null;
+
+        // Web Audio API Synth Chime
+        function playChime() {
+            try {
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+
+                const now = audioCtx.currentTime;
+                // Primer tono
+                const osc1 = audioCtx.createOscillator();
+                const gain1 = audioCtx.createGain();
+                osc1.type = 'sine';
+                osc1.frequency.setValueAtTime(587.33, now); // D5
+                gain1.gain.setValueAtTime(0.3, now);
+                gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
+                osc1.connect(gain1);
+                gain1.connect(audioCtx.destination);
+                osc1.start(now);
+                osc1.stop(now + 0.6);
+
+                // Segundo tono
+                const osc2 = audioCtx.createOscillator();
+                const gain2 = audioCtx.createGain();
+                osc2.type = 'sine';
+                osc2.frequency.setValueAtTime(880.00, now + 0.15); // A5
+                gain2.gain.setValueAtTime(0.4, now + 0.15);
+                gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.85);
+                osc2.connect(gain2);
+                gain2.connect(audioCtx.destination);
+                osc2.start(now + 0.15);
+                osc2.stop(now + 0.85);
+
+                if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+            } catch (e) {
+                console.log('Audio no disponible:', e);
+            }
+        }
+
+        function testAlarm() {
+            playChime();
+        }
+
+        // Manejo de dígitos del PIN
+        function pressKey(digit) {
+            if (currentPin.length < 6) {
+                currentPin += digit;
+                updatePinDisplay();
+            }
+        }
+
+        function backspace() {
+            currentPin = currentPin.slice(0, -1);
+            updatePinDisplay();
+        }
+
+        function clearToken() {
+            currentPin = '';
+            updatePinDisplay();
+        }
+
+        function updatePinDisplay() {
+            for (let i = 0; i < 6; i++) {
+                const cell = document.getElementById('c' + i);
+                if (i < currentPin.length) {
+                    cell.innerText = currentPin[i];
+                    cell.className = 'token-cell filled';
+                } else if (i === currentPin.length) {
+                    cell.innerText = '';
+                    cell.className = 'token-cell active';
+                } else {
+                    cell.innerText = '';
+                    cell.className = 'token-cell';
+                }
+            }
+            const btn = document.getElementById('btnSubmit');
+            btn.disabled = currentPin.length < 4;
+        }
+
+        async function submitToken() {
+            if (currentPin.length < 4) return;
+            const btn = document.getElementById('btnSubmit');
+            btn.disabled = true;
+            btn.innerText = 'Enviando a Banco Sol...';
+
+            try {
+                const res = await fetch('/api/authorize', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: currentPin })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    btn.innerText = 'Autorizando en Banco Sol...';
+                } else {
+                    alert(data.reason || 'Error al enviar token');
+                    btn.disabled = false;
+                    btn.innerText = '⚡ TRANSFERIR AHORA';
+                }
+            } catch (e) {
+                alert('Error de conexión con la PC');
+                btn.disabled = false;
+                btn.innerText = '⚡ TRANSFERIR AHORA';
+            }
+        }
+
+        function showTransferAlert(transfer) {
+            document.getElementById('idleCard').style.display = 'none';
+            document.getElementById('successCard').style.display = 'none';
+            document.getElementById('alertCard').style.display = 'block';
+
+            document.getElementById('orderIdText').innerText = transfer.id || 'P2P';
+            document.getElementById('amountText').innerText = 'Bs ' + parseFloat(transfer.amountBob).toFixed(2);
+            document.getElementById('beneficiaryText').innerText = transfer.beneficiaryName || '-';
+            document.getElementById('bankText').innerText = transfer.destinationBank || '-';
+            document.getElementById('accountText').innerText = transfer.accountNumber || '-';
+            document.getElementById('glosaText').innerText = transfer.glosa || '-';
+
+            clearToken();
+            playChime();
+        }
+
+        function showSuccess(result) {
+            document.getElementById('alertCard').style.display = 'none';
+            document.getElementById('idleCard').style.display = 'none';
+            document.getElementById('successCard').style.display = 'block';
+
+            const img = document.getElementById('receiptImg');
+            img.src = '/api/receipt?t=' + Date.now();
+        }
+
+        function resetToIdle() {
+            document.getElementById('alertCard').style.display = 'none';
+            document.getElementById('successCard').style.display = 'none';
+            document.getElementById('idleCard').style.display = 'flex';
+            clearToken();
+        }
+
+        // Cargar estadísticas
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                if (data.balanceUsdt !== undefined) {
+                    document.getElementById('statBalance').innerText = parseFloat(data.balanceUsdt).toFixed(2) + ' USDT';
+                    document.getElementById('statBalanceBob').innerText = '≈ ' + (parseFloat(data.balanceUsdt) * 11.28).toFixed(2) + ' BOB';
+                }
+                if (data.dailyProfitBob !== undefined) {
+                    document.getElementById('statProfit').innerText = '+' + parseFloat(data.dailyProfitBob).toFixed(2) + ' BOB';
+                }
+            } catch (e) {}
+        }
+
+        // Conexión en tiempo real con SSE
+        function connectEventStream() {
+            const es = new EventSource('/api/stream');
+
+            es.onopen = () => {
+                document.getElementById('connStatus').innerHTML = '<div class="pulsing-dot"></div><span>En Línea</span>';
+            };
+
+            es.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (msg.type === 'TOKEN_REQUESTED') {
+                        showTransferAlert(msg.data);
+                    } else if (msg.type === 'TRANSFER_COMPLETED') {
+                        showSuccess(msg.data);
+                    } else if (msg.type === 'TRANSFER_CANCELLED') {
+                        alert('Transferencia cancelada o tiempo expirado');
+                        resetToIdle();
+                    } else if (msg.type === 'STATUS_UPDATE') {
+                        if (msg.data.pendingTransfer) {
+                            showTransferAlert(msg.data.pendingTransfer);
+                        }
+                    }
+                } catch (e) {}
+            };
+
+            es.onerror = () => {
+                document.getElementById('connStatus').innerHTML = '<span style="color: #EF4444;">● Reconectando...</span>';
+                setTimeout(connectEventStream, 3000);
+            };
+        }
+
+        window.onload = () => {
+            connectEventStream();
+            fetchStats();
+            setInterval(fetchStats, 10000);
+        };
+    </script>
+</body>
+</html>
